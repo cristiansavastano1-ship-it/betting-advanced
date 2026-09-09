@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -54,7 +53,7 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
 
 def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, data_riferimento=None):
     n_storico = len(giocate)
-    if n_storico < 10: return None
+    if n_storico < 5: return None
     if data_riferimento is None or pd.isna(data_riferimento):
         data_riferimento = giocate['Date_parsed'].max()
 
@@ -198,7 +197,7 @@ def carica_dati_api_europee(codice_competizione, api_key):
             })
         df = pd.DataFrame(rows)
         df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
-        return df
+        return df.sort_values('Date_parsed').reset_index(drop=True)
     except Exception as e:
         return None
 
@@ -255,12 +254,25 @@ else:
         st.error("Errore nel recupero dati API o chiave non valida.")
         st.stop()
         
+    # Separiamo lo storico (partite già giocate con risultato) dalle partite future
+    dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
+    dati_future = dati[dati['Status'] != 'FINISHED'].copy()
+    
     opzioni_partite = []
     mappa_partite = []
-    for _, r in dati.iterrows():
-        stato_txt = "FUTURA" if r['Status'] != 'FINISHED' else "GIOCATA"
-        opzioni_partite.append(f"{stato_txt} ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
+    
+    # Mettiamo prima le partite future da giocare
+    for _, r in dati_future.iterrows():
+        opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
+        
+    # Poi aggiungiamo le ultime giocate per test/controllo
+    for _, r in dati_storico.tail(10).iterrows():
+        opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
+        mappa_partite.append(r.to_dict())
+        
+    # Usiamo lo storico come dataset di riferimento per calcolare la forma e le medie delle coppe
+    dati = dati_storico
 
 if not opzioni_partite:
     st.warning("Nessuna partita disponibile al momento.")
@@ -272,11 +284,10 @@ else:
     modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], rho_val, ewma_span_val, emivita_val)
     
     if modello is None:
-        st.error("Campione insufficiente per elaborare le statistiche di questa partita.")
+        st.error("Campione insufficiente per elaborare le statistiche di questa partita (assicurati che la squadra abbia abbastanza match storici registrati nella competizione).")
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
-        # Funzione di supporto per formattare la percentuale con barra grafica o stringa pulita
         def crea_tabella(dati_dict, col_nome="Mercato"):
             df = pd.DataFrame(list(dati_dict.items()), columns=[col_nome, "Probabilità (%)"])
             df["Probabilità (%)"] = df["Probabilità (%)"].round(1)
