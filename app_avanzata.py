@@ -1,5 +1,4 @@
 
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,20 +7,20 @@ import io
 from datetime import date
 from scipy.stats import poisson
 
-st.set_page_config(page_title="Advanced Betting Model + Cups & Sorting", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="Advanced Betting Model", page_icon="⚽", layout="centered")
 
 CAMPIONATI_DOMESTICI = {
-    "Italia - Serie A": {"id_fd": "I1", "tipo": "co.uk"},
-    "Inghilterra - Premier League": {"id_fd": "E0", "tipo": "co.uk"},
-    "Spagna - La Liga": {"id_fd": "SP1", "tipo": "co.uk"},
-    "Germania - Bundesliga": {"id_fd": "D1", "tipo": "co.uk"},
-    "Francia - Ligue 1": {"id_fd": "F1", "tipo": "co.uk"},
+    "Italia - Serie A": {"id_fd": "I1"},
+    "Inghilterra - Premier League": {"id_fd": "E0"},
+    "Spagna - La Liga": {"id_fd": "SP1"},
+    "Germania - Bundesliga": {"id_fd": "D1"},
+    "Francia - Ligue 1": {"id_fd": "F1"},
 }
 
 CAMPIONATI_COPPE = {
-    "🌍 UEFA Champions League": {"code": "CL", "tipo": "api"},
-    "🌍 UEFA Europa League": {"code": "EL", "tipo": "api"},
-    "🌍 UEFA Conference League": {"code": "UECL", "tipo": "api"},
+    "🌍 UEFA Champions League": {"code": "CL"},
+    "🌍 UEFA Europa League": {"code": "EL"},
+    "🌍 UEFA Conference League": {"code": "UECL"},
 }
 
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -126,12 +125,11 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
         multigol_trasf = {k: v*f for k, v in multigol_trasf.items()}
         combo_stats = {k: v*f for k, v in combo_stats.items()}
 
-    # Ordinamento decrescente dei risultati esatti per probabilità
     risultati_ordinati = sorted(risultati, key=lambda x: x['p'], reverse=True)
 
     return {
         "lambda_casa": lam_c, "lambda_trasferta": lam_t,
-        "prob_1": prob_1, "prob_X": prob_X, "prob_2": prob_2,
+        "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
         "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
         "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
         "combo": combo_stats, "angoli_stimati": f"{corner_casa + corner_trasf:.1f}",
@@ -168,8 +166,6 @@ def carica_fixture_future(id_fd):
     if df is not None:
         fx = df.copy()
         fx.columns = fx.columns.str.strip()
-        if 'Div' in fx.codes if 'Div' in fx.columns else 'Div' in fx.columns:
-            pass
         if 'Div' in fx.columns:
             fx = fx[fx['Div'] == id_fd].copy()
             fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
@@ -213,9 +209,8 @@ def carica_dati_api_europee(codice_competizione, api_key):
         return None
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico con Ordinamento Decrescente & Coppe Europee")
+st.caption("Modello Statistico con Parametri Dinamici, Ordinamento Decrescente & Coppe Europee")
 
-# ================= SIDEBAR CONFIGURAZIONE =================
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
     api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password", help="Necessaria per Champions, Europa e Conference League")
