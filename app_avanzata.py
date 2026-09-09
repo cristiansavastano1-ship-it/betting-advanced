@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,7 +7,7 @@ import io
 from datetime import date
 from scipy.stats import poisson
 
-st.set_page_config(page_title="Advanced Betting Model", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="Advanced Betting Model + Edge", page_icon="⚽", layout="centered")
 
 CAMPIONATI = {
     "Italia - Serie A": {"id_fd": "I1"},
@@ -16,8 +17,6 @@ CAMPIONATI = {
     "Francia - Ligue 1": {"id_fd": "F1"},
 }
 
-EWMA_SPAN = 6
-GIORNI_EMIVITA_DECADIMENTO = 180
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 def codici_stagione(oggi=None):
@@ -34,41 +33,41 @@ def tau_dixon_coles(gc, gt, lc, lt, rho):
     elif gc == 1 and gt == 1: return 1 - rho
     return 1.0
 
-def media_ewma(serie):
+def media_ewma(serie, span):
     serie = serie.dropna()
     if len(serie) == 0: return None
-    return serie.ewm(span=EWMA_SPAN, min_periods=1).mean().iloc[-1]
+    return serie.ewm(span=span, min_periods=1).mean().iloc[-1]
 
-def media_pesata_decadimento(df, colonna, data_riferimento):
+def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
     sub = df[[colonna, 'Date_parsed']].dropna()
     if len(sub) == 0: return None
     giorni = (data_riferimento - sub['Date_parsed']).dt.days.clip(lower=0)
-    pesi = 0.5 ** (giorni / GIORNI_EMIVITA_DECADIMENTO)
+    pesi = 0.5 ** (giorni / emivita)
     tot = pesi.sum()
     return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
 
-def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data_riferimento=None):
+def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, data_riferimento=None):
     n_storico = len(giocate)
     if n_storico < 15: return None
     if data_riferimento is None or pd.isna(data_riferimento):
         data_riferimento = giocate['Date_parsed'].max()
 
-    m_gol_casa = media_pesata_decadimento(giocate, 'FTHG', data_riferimento)
-    m_gol_trasf = media_pesata_decadimento(giocate, 'FTAG', data_riferimento)
+    m_gol_casa = media_pesata_decadimento(giocate, 'FTHG', data_riferimento, emivita)
+    m_gol_trasf = media_pesata_decadimento(giocate, 'FTAG', data_riferimento, emivita)
     if m_gol_casa is None or m_gol_trasf is None: return None
 
     forma_casa = giocate[giocate['HomeTeam'] == squadra_casa]
     forma_trasf = giocate[giocate['AwayTeam'] == squadra_trasferta]
 
-    gf_casa_rec = media_ewma(forma_casa['FTHG']) or m_gol_casa
-    gs_casa_rec = media_ewma(forma_casa['FTAG']) or m_gol_trasf
-    gf_trasf_rec = media_ewma(forma_trasf['FTAG']) or m_gol_trasf
-    gs_trasf_rec = media_ewma(forma_trasf['FTHG']) or m_gol_casa
+    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) or m_gol_casa
+    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) or m_gol_trasf
+    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) or m_gol_trasf
+    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) or m_gol_casa
 
-    tiri_casa = (media_ewma(forma_casa['HST']) if 'HST' in forma_casa.columns else None) or 4.0
-    corner_casa = (media_ewma(forma_casa['HC']) if 'HC' in forma_casa.columns else None) or 5.0
-    tiri_trasf = (media_ewma(forma_trasf['AST']) if 'AST' in forma_trasf.columns else None) or 3.5
-    corner_trasf = (media_ewma(forma_trasf['AC']) if 'AC' in forma_trasf.columns else None) or 4.5
+    tiri_casa = (media_ewma(forma_casa['HST'], ewma_span) if 'HST' in forma_casa.columns else None) or 4.0
+    corner_casa = (media_ewma(forma_casa['HC'], ewma_span) if 'HC' in forma_casa.columns else None) or 5.0
+    tiri_trasf = (media_ewma(forma_trasf['AST'], ewma_span) if 'AST' in forma_trasf.columns else None) or 3.5
+    corner_trasf = (media_ewma(forma_trasf['AC'], ewma_span) if 'AC' in forma_trasf.columns else None) or 4.5
 
     lam_c = (gf_casa_rec / max(0.1, m_gol_casa)) * (gs_trasf_rec / max(0.1, m_gol_trasf)) * m_gol_casa
     lam_t = (gf_trasf_rec / max(0.1, m_gol_trasf)) * (gs_casa_rec / max(0.1, m_gol_casa)) * m_gol_trasf
@@ -142,7 +141,6 @@ def carica_dati_campionato(id_fd):
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
     for codice in [codice_precedente, codice_corrente]:
-        # URL senza 'www' per massima compatibilità
         url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
         df, _ = scarica_csv_robusto(url)
         if df is not None:
@@ -168,10 +166,14 @@ def carica_fixture_future(id_fd):
     return pd.DataFrame()
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico: 1X2, Under/Over, Multigol, Angoli, Tiri & Combo")
+st.caption("Modello Statistico con Parametri Dinamici & Analisi Edge Quote")
 
-if "rho" not in st.session_state:
-    st.session_state.rho = -0.10
+# ================= SIDEBAR CONFIGURAZIONE =================
+with st.sidebar:
+    st.header("⚙️ Parametri Modello")
+    rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
+    ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
+    emivita_val = st.slider("Decadimento Temporale (Giorni)", 30, 365, 180, 10)
 
 campionato = st.selectbox("Seleziona Torneo", list(CAMPIONATI.keys()))
 info = CAMPIONATI[campionato]
@@ -205,7 +207,7 @@ else:
     idx_sel = opzioni_partite.index(scelta)
     partita_sel = mappa_partite[idx_sel]
     
-    modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], st.session_state.rho)
+    modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], rho_val, ewma_span_val, emivita_val)
     
     if modello is None:
         st.error("Campione insufficiente per elaborare le statistiche di questa partita.")
@@ -217,6 +219,29 @@ else:
         c2.metric("X (Pareggio)", f"{modello['prob_X']:.1f}%")
         c3.metric("2 (Trasferta)", f"{modello['prob_2']:.1f}%")
         
+        # Estrazione Quote Mercato se disponibili nel record (es. Bet365)
+        quota_1 = partita_sel.get('B365H', np.nan)
+        quota_x = partita_sel.get('B365D', np.nan)
+        quota_2 = partita_sel.get('B365A', np.nan)
+        
+        if pd.notna(quota_1) and pd.notna(quota_x) and pd.notna(quota_2):
+            st.markdown("---")
+            st.markdown("**💰 Analisi Edge / Value (vs Bookmaker Bet365)**")
+            
+            # Quota equa stimata dal modello = 100 / Probabilità %
+            q_equa_1 = 100.0 / modello['prob_1'] if modello['prob_1'] > 0 else 0
+            q_equa_x = 100.0 / modello['prob_X'] if modello['prob_X'] > 0 else 0
+            q_equa_2 = 100.0 / modello['prob_2'] if modello['prob_2'] > 0 else 0
+            
+            edge_1 = ((quota_1 / q_equa_1) - 1) * 100 if q_equa_1 > 0 else 0
+            edge_x = ((quota_x / q_equa_x) - 1) * 100 if q_equa_x > 0 else 0
+            edge_2 = ((quota_2 / q_equa_2) - 1) * 100 if q_equa_2 > 0 else 0
+            
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.metric("Quota 1 Reale", f"{quota_1}", delta=f"Edge: {edge_1:+.1f}%")
+            ec2.metric("Quota X Reale", f"{quota_x}", delta=f"Edge: {edge_x:+.1f}%")
+            ec3.metric("Quota 2 Reale", f"{quota_2}", delta=f"Edge: {edge_x:+.1f}%" if False else f"Edge: {edge_2:+.1f}%")
+
         st.divider()
         
         col_a, col_b = st.columns(2)
