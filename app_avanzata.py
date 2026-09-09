@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -77,7 +78,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
     lam_c = (gf_casa_rec / max(0.1, m_gol_casa)) * (gs_trasf_rec / max(0.1, m_gol_trasf)) * m_gol_casa
     lam_t = (gf_trasf_rec / max(0.1, m_gol_trasf)) * (gs_casa_rec / max(0.1, m_gol_casa)) * m_gol_trasf
 
-    risultati = []
     prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
     prob_goal, prob_nogoal = 0.0, 0.0
     limiti_under = [1.5, 2.5, 3.5]
@@ -85,11 +85,13 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
     
     multigol_casa = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     multigol_trasf = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    combo_stats = {"1_e_gol": 0.0, "1_e_over25": 0.0, "x_e_under25": 0.0, "2_e_gol": 0.0}
+    combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
 
+    tot_p = 0.0
     for gc in range(8):
         for gt in range(8):
             p = poisson.pmf(gc, lam_c) * poisson.pmf(gt, lam_t) * tau_dixon_coles(gc, gt, lam_c, lam_t, rho) * 100
+            tot_p += p
             segno = 'X' if gc == gt else ('1' if gc > gt else '2')
             
             if segno == '1': prob_1 += p
@@ -106,17 +108,13 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
                 if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
                 if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
 
-            if segno == '1' and gc > 0 and gt > 0: combo_stats["1_e_gol"] += p
-            if segno == '1' and (gc + gt) > 2.5: combo_stats["1_e_over25"] += p
-            if segno == 'X' and (gc + gt) < 2.5: combo_stats["x_e_under25"] += p
-            if segno == '2' and gc > 0 and gt > 0: combo_stats["2_e_gol"] += p
+            if segno == '1' and gc > 0 and gt > 0: combo_stats["1 + Goal"] += p
+            if segno == '1' and (gc + gt) > 2.5: combo_stats["1 + Over 2.5"] += p
+            if segno == 'X' and (gc + gt) < 2.5: combo_stats["X + Under 2.5"] += p
+            if segno == '2' and gc > 0 and gt > 0: combo_stats["2 + Goal"] += p
 
-            risultati.append({'res': f"{gc}-{gt}", 'p': p, 'segno': segno})
-
-    tot = sum(r['p'] for r in risultati)
-    if tot > 0:
-        f = 100.0 / tot
-        for r in risultati: r['p'] *= f
+    if tot_p > 0:
+        f = 100.0 / tot_p
         prob_1, prob_x, prob_2 = prob_1*f, prob_x*f, prob_2*f
         prob_goal, prob_nogoal = prob_goal*f, prob_nogoal*f
         prob_under = {l: v*f for l, v in prob_under.items()}
@@ -124,15 +122,12 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
         multigol_trasf = {k: v*f for k, v in multigol_trasf.items()}
         combo_stats = {k: v*f for k, v in combo_stats.items()}
 
-    risultati_ordinati = sorted(risultati, key=lambda x: x['p'], reverse=True)
-
     return {
-        "lambda_casa": lam_c, "lambda_trasferta": lam_t,
         "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
         "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
         "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
         "combo": combo_stats, "angoli_stimati": f"{corner_casa + corner_trasf:.1f}",
-        "tiri_stimati": f"{tiri_casa + tiri_trasf:.1f}", "risultati": risultati_ordinati
+        "tiri_stimati": f"{tiri_casa + tiri_trasf:.1f}"
     }
 
 def scarica_csv_robusto(url):
@@ -208,7 +203,7 @@ def carica_dati_api_europee(codice_competizione, api_key):
         return None
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Completo con Ordinamento Decrescente per Probabilità")
+st.caption("Modello Statistico Avanzato con Tabelle Dinamiche in Ordine Decrescente")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -281,71 +276,52 @@ else:
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
-        # 1X2 Ordinato in modo decrescente
-        mercato_1x2 = [("1 (Casa)", modello['prob_1']), ("X (Pareggio)", modello['prob_X']), ("2 (Trasferta)", modello['prob_2'])]
-        mercato_1x2_sort = sorted(mercato_1x2, key=lambda x: x[1], reverse=True)
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric(mercato_1x2_sort[0][0], f"{mercato_1x2_sort[0][1]:.1f}%")
-        c2.metric(mercato_1x2_sort[1][0], f"{mercato_1x2_sort[1][1]:.1f}%")
-        c3.metric(mercato_1x2_sort[2][0], f"{mercato_1x2_sort[2][1]:.1f}%")
-        
-        st.divider()
-        
+        # Funzione di supporto per formattare la percentuale con barra grafica o stringa pulita
+        def crea_tabella(dati_dict, col_nome="Mercato"):
+            df = pd.DataFrame(list(dati_dict.items()), columns=[col_nome, "Probabilità (%)"])
+            df["Probabilità (%)"] = df["Probabilità (%)"].round(1)
+            df = df.sort_values(by="Probabilità (%)", ascending=False).reset_index(drop=True)
+            df["Probabilità (%)"] = df["Probabilità (%)"].astype(str) + "%"
+            return df
+
+        st.markdown("### 🏆 Esito Finale (1X2)")
+        df_1x2 = crea_tabella({
+            "1 (Casa)": modello['prob_1'],
+            "X (Pareggio)": modello['prob_X'],
+            "2 (Trasferta)": modello['prob_2']
+        }, "Segno")
+        st.dataframe(df_1x2, use_container_width=True, hide_index=True)
+
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("**⚽ Goal / No Goal (Ordinati)**")
-            mercato_gg = [("Goal", modello['prob_goal']), ("No Goal", modello['prob_nogoal'])]
-            for label, p in sorted(mercato_gg, key=lambda x: x[1], reverse=True):
-                st.write(f"- {label}: **{p:.1f}%**")
-                
+            st.markdown("### ⚽ Goal / No Goal")
+            df_gg = crea_tabella({"Goal": modello['prob_goal'], "No Goal": modello['prob_nogoal']}, "Opzione")
+            st.dataframe(df_gg, use_container_width=True, hide_index=True)
+            
         with col_b:
-            st.markdown("**📉 Under / Over (Ordinati)**")
-            oo_list = []
+            st.markdown("### 📉 Under / Over")
+            oo_dict = {}
             for soglia, prob_u in modello['prob_under'].items():
-                oo_list.append((f"Under {soglia}", prob_u))
-                oo_list.append((f"Over {soglia}", 100 - prob_u))
-            for label, p in sorted(oo_list, key=lambda x: x[1], reverse=True):
-                st.write(f"- {label}: **{p:.1f}%**")
-
-        st.divider()
+                oo_dict[f"Under {soglia}"] = prob_u
+                oo_dict[f"Over {soglia}"] = 100 - prob_u
+            df_oo = crea_tabella(oo_dict, "Linea")
+            st.dataframe(df_oo, use_container_width=True, hide_index=True)
 
         col_c, col_d = st.columns(2)
         with col_c:
-            st.markdown("**🏠 Multigol Casa (Ordinati)**")
-            mg_c_sort = sorted(modello['multigol_casa'].items(), key=lambda x: x[1], reverse=True)
-            for k, v in mg_c_sort:
-                st.write(f"- Casa {k}: **{v:.1f}%**")
-                
+            st.markdown("### 🏠 Multigol Casa")
+            df_mg_c = crea_tabella(modello['multigol_casa'], "Intervallo")
+            st.dataframe(df_mg_c, use_container_width=True, hide_index=True)
+            
         with col_d:
-            st.markdown("**✈️ Multigol Ospite (Ordinati)**")
-            mg_t_sort = sorted(modello['multigol_trasf'].items(), key=lambda x: x[1], reverse=True)
-            for k, v in mg_t_sort:
-                st.write(f"- Ospite {k}: **{v:.1f}%**")
+            st.markdown("### ✈️ Multigol Ospite")
+            df_mg_t = crea_tabella(modello['multigol_trasf'], "Intervallo")
+            st.dataframe(df_mg_t, use_container_width=True, hide_index=True)
+
+        st.markdown("### 🔥 Combo Consigliate")
+        df_combo = crea_tabella(modello['combo'], "Combinazione")
+        st.dataframe(df_combo, use_container_width=True, hide_index=True)
 
         st.divider()
-
-        st.markdown("**🔥 Combo Preferite (Ordinate)**")
-        combo_labels = {
-            "1 + Goal": modello['combo']['1_e_gol'],
-            "1 + Over 2.5": modello['combo']['1_e_over25'],
-            "X + Under 2.5": modello['combo']['x_e_under25'],
-            "2 + Goal": modello['combo']['2_e_gol']
-        }
-        combo_sort = sorted(combo_labels.items(), key=lambda x: x[1], reverse=True)
-        cc1, cc2 = st.columns(2)
-        cc1.write(f"- {combo_sort[0][0]}: **{combo_sort[0][1]:.1f}%**")
-        cc1.write(f"- {combo_sort[1][0]}: **{combo_sort[1][1]:.1f}%**")
-        cc2.write(f"- {combo_sort[2][0]}: **{combo_sort[2][1]:.1f}%**")
-        cc2.write(f"- {combo_sort[3][0]}: **{combo_sort[3][1]:.1f}%**")
-
-        st.divider()
-
-        st.markdown("**🎯 Risultati Esatti Top (Ordinati per % decrescente)**")
-        top_risultati = modello['risultati'][:6]
-        for tr in top_risultati:
-            st.write(f"- Risultato **{tr['res']}** ({tr['segno']}): **{tr['p']:.1f}%**")
-
-        st.divider()
-        st.markdown("**📌 Statistiche Match (Angoli & Tiri stimati)**")
-        st.info(f"Angoli Totali Stimati: **{modello['angoli_stimati']}** | Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**")
+        st.markdown("### 🎯 Statistiche Match (Stimate)")
+        st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | 🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**")
