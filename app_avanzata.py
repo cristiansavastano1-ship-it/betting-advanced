@@ -120,7 +120,6 @@ def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale
     c_lim = squadra_casa.strip().lower()
     t_lim = squadra_trasferta.strip().lower()
     
-    # Unisce le fonti disponibili per cercare i precedenti
     frames_tot = []
     if df_coppa is not None and not df_coppa.empty:
         frames_tot.append(df_coppa)
@@ -144,7 +143,7 @@ def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale
     
     if 'Date_parsed' in h2h.columns:
         h2h = h2h.sort_values('Date_parsed', ascending=False)
-    return h2h.head(5) # Ultimi 5 precedenti
+    return h2h.head(5) 
 
 def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, df_globale):
     giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
@@ -288,8 +287,17 @@ def carica_dati_api_europee(codice_competizione, api_key):
     except Exception as e:
         return str(e)
 
+def estrai_quota_sicura(dizionario, chiave, default=2.00):
+    val = dizionario.get(chiave)
+    if pd.isna(val) or val == '' or val is None:
+        return float(default)
+    try:
+        return float(val)
+    except:
+        return float(default)
+
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Avanzato con Calcolatore Value Bet & H2H")
+st.caption("Modello Statistico Avanzato con Calcolatore Value Bet Automatico & H2H")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -306,7 +314,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     info = CAMPIONATI_DOMESTICI[campionato]
     id_fd = info["id_fd"]
     
-    with st.spinner("Caricamento dataset campionato..."):
+    with st.spinner("Caricamento dataset campionato e quote automatiche..."):
         dati = carica_dati_campionato(id_fd)
         fixture_future = carica_fixture_future(id_fd)
         
@@ -366,7 +374,7 @@ else:
         mappa_partite.append(r.to_dict())
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile al moment.")
+    st.warning("Nessuna partita disponibile al momento.")
 else:
     scelta = st.selectbox("Seleziona Partita", opzioni_partite)
     idx_sel = opzioni_partite.index(scelta)
@@ -394,32 +402,46 @@ else:
         }, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
 
-        # ----------------- CALCOLATORE VALUE BET -----------------
-        st.markdown("### 💰 Calcolatore Value Bet (Verifica Quote)")
-        st.caption("Inserisci le quote offerte dal tuo bookmaker per scoprire se c'è valore matematico (EV > 0).")
+        # ----------------- CALCOLATORE VALUE BET (AUTOMATICO) -----------------
+        st.markdown("### 💰 Analisi Value Bet (Quote Reali Automatica)")
+        st.caption("Le quote vengono estratte automaticamente dai provider (Bet365/Pinnacle) dove disponibili.")
+        
+        # Estrazione quote automatiche dal dizionario della partita
+        quota_1_auto = estrai_quota_sicura(partita_sel, 'B365H', 2.00)
+        quota_X_auto = estrai_quota_sicura(partita_sel, 'B365D', 3.30)
+        quota_2_auto = estrai_quota_sicura(partita_sel, 'B365A', 3.50)
+
         col_q1, col_qx, col_q2 = st.columns(3)
         with col_q1:
-            q_1 = st.number_input("Quota 1", min_value=1.01, max_value=50.0, value=2.00, step=0.05)
+            q_1 = st.number_input("Quota 1", min_value=1.01, max_value=50.0, value=quota_1_auto, step=0.05)
             ev_1 = (modello['prob_1'] / 100.0) * q_1
-            if ev_1 > 1.0:
-                st.success(f"🔥 VALUE BET! (EV: {ev_1:.2f})")
+            if ev_1 > 1.05:
+                st.success(f"🔥 ALTO VALORE! (EV: {ev_1:.2f})")
+            elif ev_1 > 1.0:
+                st.warning(f"📈 Leggero Valore (EV: {ev_1:.2f})")
             else:
                 st.info(f"Nessun valore (EV: {ev_1:.2f})")
+                
         with col_qx:
-            q_x = st.number_input("Quota X", min_value=1.01, max_value=50.0, value=3.30, step=0.05)
+            q_x = st.number_input("Quota X", min_value=1.01, max_value=50.0, value=quota_X_auto, step=0.05)
             ev_x = (modello['prob_X'] / 100.0) * q_x
-            if ev_x > 1.0:
-                st.success(f"🔥 VALUE BET! (EV: {ev_x:.2f})")
+            if ev_x > 1.05:
+                st.success(f"🔥 ALTO VALORE! (EV: {ev_x:.2f})")
+            elif ev_x > 1.0:
+                st.warning(f"📈 Leggero Valore (EV: {ev_x:.2f})")
             else:
                 st.info(f"Nessun valore (EV: {ev_x:.2f})")
+                
         with col_q2:
-            q_2 = st.number_input("Quota 2", min_value=1.01, max_value=50.0, value=3.50, step=0.05)
+            q_2 = st.number_input("Quota 2", min_value=1.01, max_value=50.0, value=quota_2_auto, step=0.05)
             ev_2 = (modello['prob_2'] / 100.0) * q_2
-            if ev_2 > 1.0:
-                st.success(f"🔥 VALUE BET! (EV: {ev_2:.2f})")
+            if ev_2 > 1.05:
+                st.success(f"🔥 ALTO VALORE! (EV: {ev_2:.2f})")
+            elif ev_2 > 1.0:
+                st.warning(f"📈 Leggero Valore (EV: {ev_2:.2f})")
             else:
                 st.info(f"Nessun valore (EV: {ev_2:.2f})")
-        # ---------------------------------------------------------
+        # ----------------------------------------------------------------------
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -451,7 +473,6 @@ else:
         df_combo = crea_tabella(modello['combo'], "Combinazione")
         st.dataframe(df_combo, use_container_width=True, hide_index=True)
 
-        # ----------------- ANALISI PRECEDENTI H2H -----------------
         st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
         df_h2h = estrai_scontri_diretti(partita_sel['HomeTeam'], partita_sel['AwayTeam'], dati, df_globale)
         if not df_h2h.empty:
@@ -459,7 +480,6 @@ else:
             st.dataframe(df_h2h[cols_mostra], use_container_width=True, hide_index=True)
         else:
             st.info("Nessun precedente recente trovato negli archivi disponibili tra queste due squadre.")
-        # ---------------------------------------------------------
 
         st.divider()
         st.markdown("### 🎯 Statistiche Match (Stimate)")
