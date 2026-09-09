@@ -287,7 +287,7 @@ def carica_dati_api_europee(codice_competizione, api_key):
     except Exception as e:
         return str(e)
 
-def estrai_quota_sicura(dizionario, chiave, default=2.00):
+def estrai_quota_sicura(dizionario, chiave, default=0.0):
     val = dizionario.get(chiave)
     if pd.isna(val) or val == '' or val is None:
         return float(default)
@@ -297,7 +297,7 @@ def estrai_quota_sicura(dizionario, chiave, default=2.00):
         return float(default)
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Avanzato con Calcolatore Value Bet Automatico & H2H")
+st.caption("Modello Statistico Avanzato con Analisi Value Bet 1X2 Automatica")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -402,46 +402,28 @@ else:
         }, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
 
-        # ----------------- CALCOLATORE VALUE BET (AUTOMATICO) -----------------
-        st.markdown("### 💰 Analisi Value Bet (Quote Reali Automatica)")
-        st.caption("Le quote vengono estratte automaticamente dai provider (Bet365/Pinnacle) dove disponibili.")
+        # ----------------- ANALISI VALUE BET AUTOMATICA (SENZA INPUT) -----------------
+        st.markdown("### 💰 Controllo Value Bet (Automatico da Quote Reali)")
         
-        # Estrazione quote automatiche dal dizionario della partita
-        quota_1_auto = estrai_quota_sicura(partita_sel, 'B365H', 2.00)
-        quota_X_auto = estrai_quota_sicura(partita_sel, 'B365D', 3.30)
-        quota_2_auto = estrai_quota_sicura(partita_sel, 'B365A', 3.50)
+        q_1 = estrai_quota_sicura(partita_sel, 'B365H', 0.0)
+        q_x = estrai_quota_sicura(partita_sel, 'B365D', 0.0)
+        q_2 = estrai_quota_sicura(partita_sel, 'B365A', 0.0)
 
-        col_q1, col_qx, col_q2 = st.columns(3)
-        with col_q1:
-            q_1 = st.number_input("Quota 1", min_value=1.01, max_value=50.0, value=quota_1_auto, step=0.05)
+        if q_1 > 0 and q_x > 0 and q_2 > 0:
             ev_1 = (modello['prob_1'] / 100.0) * q_1
-            if ev_1 > 1.05:
-                st.success(f"🔥 ALTO VALORE! (EV: {ev_1:.2f})")
-            elif ev_1 > 1.0:
-                st.warning(f"📈 Leggero Valore (EV: {ev_1:.2f})")
-            else:
-                st.info(f"Nessun valore (EV: {ev_1:.2f})")
-                
-        with col_qx:
-            q_x = st.number_input("Quota X", min_value=1.01, max_value=50.0, value=quota_X_auto, step=0.05)
             ev_x = (modello['prob_X'] / 100.0) * q_x
-            if ev_x > 1.05:
-                st.success(f"🔥 ALTO VALORE! (EV: {ev_x:.2f})")
-            elif ev_x > 1.0:
-                st.warning(f"📈 Leggero Valore (EV: {ev_x:.2f})")
-            else:
-                st.info(f"Nessun valore (EV: {ev_x:.2f})")
-                
-        with col_q2:
-            q_2 = st.number_input("Quota 2", min_value=1.01, max_value=50.0, value=quota_2_auto, step=0.05)
             ev_2 = (modello['prob_2'] / 100.0) * q_2
-            if ev_2 > 1.05:
-                st.success(f"🔥 ALTO VALORE! (EV: {ev_2:.2f})")
-            elif ev_2 > 1.0:
-                st.warning(f"📈 Leggero Valore (EV: {ev_2:.2f})")
-            else:
-                st.info(f"Nessun valore (EV: {ev_2:.2f})")
-        # ----------------------------------------------------------------------
+
+            dati_ev = [
+                {"Segno": "1 (Casa)", "Quota Reale": q_1, "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
+                {"Segno": "X (Pareggio)", "Quota Reale": q_x, "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
+                {"Segno": "2 (Trasferta)", "Quota Reale": q_2, "Valutazione": "🔥 ALTO VALORE" if ev_2 > 1.05 else ("📈 Leggero Valore" if ev_2 > 1.0 else "Nessun Valore")}
+            ]
+            df_ev_mostra = pd.DataFrame(dati_ev)
+            st.dataframe(df_ev_mostra, use_container_width=True, hide_index=True)
+        else:
+            st.info("ℹ️ Quote dei bookmaker non disponibili per questa specifica partita (comune nelle partite future delle Coppe o in alcuni anticipi/posticipi non ancora quotati).")
+        # -----------------------------------------------------------------------------
 
         col_a, col_b = st.columns(2)
         with col_a:
