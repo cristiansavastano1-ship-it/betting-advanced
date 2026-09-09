@@ -14,8 +14,6 @@ CAMPIONATI = {
     "Spagna - La Liga": {"id_fd": "SP1"},
     "Germania - Bundesliga": {"id_fd": "D1"},
     "Francia - Ligue 1": {"id_fd": "F1"},
-    "🌍 Champions League (solo previsione)": {"id_fdorg": "CL", "solo_previsione": True},
-    "🌍 Europa League (solo previsione)": {"id_fdorg": "EL", "solo_previsione": True},
 }
 
 EWMA_SPAN = 6
@@ -28,11 +26,6 @@ def codici_stagione(oggi=None):
     anno_inizio_precedente = anno_inizio_corrente - 1
     fmt = lambda a: f"{a % 100:02d}{(a + 1) % 100:02d}"
     return fmt(anno_inizio_corrente), fmt(anno_inizio_precedente)
-
-def anni_stagione(oggi=None):
-    oggi = oggi or date.today()
-    anno_inizio_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
-    return anno_inizio_corrente, anno_inizio_corrente - 1
 
 def tau_dixon_coles(gc, gt, lc, lt, rho):
     if gc == 0 and gt == 0: return 1 - (lc * lt * rho)
@@ -149,7 +142,8 @@ def carica_dati_campionato(id_fd):
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
     for codice in [codice_precedente, codice_corrente]:
-        url = f"https://www.football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
+        # URL senza 'www' per massima compatibilità
+        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
         df, _ = scarica_csv_robusto(url)
         if df is not None:
             df.columns = df.columns.str.strip()
@@ -161,36 +155,8 @@ def carica_dati_campionato(id_fd):
     return None
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def carica_dati_fdorg(codice_comp, api_key):
-    if not api_key: return None
-    anno_corrente, anno_precedente = anni_stagione()
-    headers = {"X-Auth-Token": api_key}
-    frames = []
-    for anno in [anno_precedente, anno_corrente]:
-        url = f"https://api.football-data.org/v4/competitions/{codice_comp}/matches?season={anno}"
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                dati_json = resp.json()
-                righe = []
-                for m in dati_json.get("matches", []):
-                    finita = m.get("status") == "FINISHED"
-                    righe.append({
-                        "HomeTeam": m["homeTeam"]["name"], "AwayTeam": m["awayTeam"]["name"],
-                        "Date": m["utcDate"][:10],
-                        "FTHG": m["score"]["fullTime"]["home"] if finita else np.nan,
-                        "FTAG": m["score"]["fullTime"]["away"] if finita else np.nan,
-                    })
-                if righe: frames.append(pd.DataFrame(righe))
-        except Exception: pass
-    if not frames: return None
-    dati = pd.concat(frames, ignore_index=True, sort=False)
-    dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce')
-    return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
-
-@st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
-    df, _ = scarica_csv_robusto("https://www.football-data.co.uk/fixtures.csv")
+    df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
     if df is not None:
         fx = df.copy()
         fx.columns = fx.columns.str.strip()
@@ -202,32 +168,21 @@ def carica_fixture_future(id_fd):
     return pd.DataFrame()
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Completo: 1X2, Under/Over, Multigol, Angoli, Tiri & Combo")
+st.caption("Modello Statistico: 1X2, Under/Over, Multigol, Angoli, Tiri & Combo")
 
 if "rho" not in st.session_state:
     st.session_state.rho = -0.10
 
-with st.sidebar:
-    api_key_fdorg = st.text_input("API Key football-data.org (per Coppe)", type="password")
-
 campionato = st.selectbox("Seleziona Torneo", list(CAMPIONATI.keys()))
 info = CAMPIONATI[campionato]
-solo_previsione = info.get("solo_previsione", False)
+id_fd = info["id_fd"]
 
 with st.spinner("Caricamento dataset in corso..."):
-    if solo_previsione:
-        dati = carica_dati_fdorg(info["id_fdorg"], api_key_fdorg)
-        fixture_future = pd.DataFrame()
-        if dati is not None:
-            fixture_future = dati[dati['FTHG'].isna()].copy()
-            dati = dati[dati['FTHG'].notna()].copy()
-    else:
-        id_fd = info["id_fd"]
-        dati = carica_dati_campionato(id_fd)
-        fixture_future = carica_fixture_future(id_fd)
+    dati = carica_dati_campionato(id_fd)
+    fixture_future = carica_fixture_future(id_fd)
 
 if dati is None or len(dati) == 0:
-    st.error("Impossibile scaricare i dati. Se usi le coppe inserisci la chiave API, oppure il sito principale è temporaneamente occupato.")
+    st.error("Impossibile scaricare i dati da football-data.co.uk. Riprova tra poco.")
     st.stop()
 
 opzioni_partite = []
