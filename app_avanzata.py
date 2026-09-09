@@ -116,6 +116,36 @@ def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
             
     return pd.DataFrame()
 
+def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
+    c_lim = squadra_casa.strip().lower()
+    t_lim = squadra_trasferta.strip().lower()
+    
+    # Unisce le fonti disponibili per cercare i precedenti
+    frames_tot = []
+    if df_coppa is not None and not df_coppa.empty:
+        frames_tot.append(df_coppa)
+    if df_globale is not None and not df_globale.empty:
+        frames_tot.append(df_globale)
+        
+    if not frames_tot:
+        return pd.DataFrame()
+        
+    df_uni = pd.concat(frames_tot, ignore_index=True, sort=False)
+    if 'FTHG' not in df_uni.columns or 'FTAG' not in df_uni.columns:
+        return pd.DataFrame()
+        
+    h2h = df_uni[
+        (df_uni['FTHG'].notna()) & (df_uni['FTAG'].notna()) &
+        (
+            ((df_uni['HomeTeam'].str.strip().str.lower() == c_lim) & (df_uni['AwayTeam'].str.strip().str.lower() == t_lim)) |
+            ((df_uni['HomeTeam'].str.strip().str.lower() == t_lim) & (df_uni['AwayTeam'].str.strip().str.lower() == c_lim))
+        )
+    ].copy()
+    
+    if 'Date_parsed' in h2h.columns:
+        h2h = h2h.sort_values('Date_parsed', ascending=False)
+    return h2h.head(5) # Ultimi 5 precedenti
+
 def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, df_globale):
     giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
     data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
@@ -161,7 +191,6 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     limiti_under = [1.5, 2.5, 3.5]
     prob_under = {l: 0.0 for l in limiti_under}
     
-    # AGGIUNTI 0-1 e 0-2
     multigol_casa = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     multigol_trasf = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
@@ -260,7 +289,7 @@ def carica_dati_api_europee(codice_competizione, api_key):
         return str(e)
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Avanzato con Cascata Intelligente per le Coppe")
+st.caption("Modello Statistico Avanzato con Calcolatore Value Bet & H2H")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -337,7 +366,7 @@ else:
         mappa_partite.append(r.to_dict())
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile al momento.")
+    st.warning("Nessuna partita disponibile al moment.")
 else:
     scelta = st.selectbox("Seleziona Partita", opzioni_partite)
     idx_sel = opzioni_partite.index(scelta)
@@ -364,6 +393,33 @@ else:
             "2 (Trasferta)": modello['prob_2']
         }, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
+
+        # ----------------- CALCOLATORE VALUE BET -----------------
+        st.markdown("### 💰 Calcolatore Value Bet (Verifica Quote)")
+        st.caption("Inserisci le quote offerte dal tuo bookmaker per scoprire se c'è valore matematico (EV > 0).")
+        col_q1, col_qx, col_q2 = st.columns(3)
+        with col_q1:
+            q_1 = st.number_input("Quota 1", min_value=1.01, max_value=50.0, value=2.00, step=0.05)
+            ev_1 = (modello['prob_1'] / 100.0) * q_1
+            if ev_1 > 1.0:
+                st.success(f"🔥 VALUE BET! (EV: {ev_1:.2f})")
+            else:
+                st.info(f"Nessun valore (EV: {ev_1:.2f})")
+        with col_qx:
+            q_x = st.number_input("Quota X", min_value=1.01, max_value=50.0, value=3.30, step=0.05)
+            ev_x = (modello['prob_X'] / 100.0) * q_x
+            if ev_x > 1.0:
+                st.success(f"🔥 VALUE BET! (EV: {ev_x:.2f})")
+            else:
+                st.info(f"Nessun valore (EV: {ev_x:.2f})")
+        with col_q2:
+            q_2 = st.number_input("Quota 2", min_value=1.01, max_value=50.0, value=3.50, step=0.05)
+            ev_2 = (modello['prob_2'] / 100.0) * q_2
+            if ev_2 > 1.0:
+                st.success(f"🔥 VALUE BET! (EV: {ev_2:.2f})")
+            else:
+                st.info(f"Nessun valore (EV: {ev_2:.2f})")
+        # ---------------------------------------------------------
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -394,6 +450,16 @@ else:
         st.markdown("### 🔥 Combo Consigliate")
         df_combo = crea_tabella(modello['combo'], "Combinazione")
         st.dataframe(df_combo, use_container_width=True, hide_index=True)
+
+        # ----------------- ANALISI PRECEDENTI H2H -----------------
+        st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
+        df_h2h = estrai_scontri_diretti(partita_sel['HomeTeam'], partita_sel['AwayTeam'], dati, df_globale)
+        if not df_h2h.empty:
+            cols_mostra = [c for c in ['Date', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam'] if c in df_h2h.columns]
+            st.dataframe(df_h2h[cols_mostra], use_container_width=True, hide_index=True)
+        else:
+            st.info("Nessun precedente recente trovato negli archivi disponibili tra queste due squadre.")
+        # ---------------------------------------------------------
 
         st.divider()
         st.markdown("### 🎯 Statistiche Match (Stimate)")
