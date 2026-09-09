@@ -89,7 +89,6 @@ def carica_tutti_i_campionati():
 def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
     squadra_lim = squadra.strip().lower()
     
-    # 1. Cerca nello storico del dataset corrente (gestendo la presenza o meno della colonna Status)
     if df_coppa is not None and not df_coppa.empty:
         if 'Status' in df_coppa.columns:
             f_coppa = df_coppa[
@@ -107,7 +106,6 @@ def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
         if len(f_coppa) > 0:
             return f_coppa
             
-    # 2. Cerca nei campionati domestici supportati
     if df_globale is not None and not df_globale.empty:
         f_glob = df_globale[
             (df_globale['HomeTeam'].str.strip().str.lower() == squadra_lim) | 
@@ -122,23 +120,21 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
     data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
 
-    # Medie generali del torneo o di fallback sicuro
     m_gol_casa = media_pesata_decadimento(giocate_validi, 'FTHG', data_riferimento, emivita) or 1.65
     m_gol_trasf = media_pesata_decadimento(giocate_validi, 'FTAG', data_riferimento, emivita) or 1.25
 
     forma_casa = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale)
     forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
 
-    # Fallback a cascata dinamico basato sul nome (hash deterministico) per squadre totalmente nuove
     if forma_casa.empty:
         seed_c = sum(ord(c) for c in squadra_casa)
-        fattore_c = 0.8 + (seed_c % 45) / 100.0  # Variazione unica da 0.80 a 1.25
+        fattore_c = 0.8 + (seed_c % 45) / 100.0
         f_imitc = pd.DataFrame({'FTHG': [m_gol_casa * fattore_c], 'FTAG': [m_gol_trasf * (2 - fattore_c)], 'Date_parsed': [data_riferimento]})
         forma_casa = f_imitc
 
     if forma_trasf.empty:
         seed_t = sum(ord(c) for c in squadra_trasferta)
-        fattore_t = 0.75 + (seed_t % 45) / 100.0 # Variazione unica da 0.75 a 1.20
+        fattore_t = 0.75 + (seed_t % 45) / 100.0
         f_imitt = pd.DataFrame({'FTHG': [m_gol_trasf * fattore_t], 'FTAG': [m_gol_casa * (2 - fattore_t)], 'Date_parsed': [data_riferimento]})
         forma_trasf = f_imitt
 
@@ -165,8 +161,9 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     limiti_under = [1.5, 2.5, 3.5]
     prob_under = {l: 0.0 for l in limiti_under}
     
-    multigol_casa = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    multigol_trasf = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
+    # AGGIUNTI 0-1 e 0-2
+    multigol_casa = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
+    multigol_trasf = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
 
     tot_p = 0.0
@@ -186,7 +183,7 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
             for l in limiti_under:
                 if gc + gt < l: prob_under[l] += p
                 
-            for mg_key, (mi_c, ma_c) in [("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
+            for mg_key, (mi_c, ma_c) in [("0-1", (0,1)), ("0-2", (0,2)), ("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
                 if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
                 if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
 
