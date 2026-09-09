@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -90,15 +89,21 @@ def carica_tutti_i_campionati():
 def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
     squadra_lim = squadra.strip().lower()
     
-    # 1. Cerca nello storico della coppa
+    # 1. Cerca nello storico del dataset corrente (gestendo la presenza o meno della colonna Status)
     if df_coppa is not None and not df_coppa.empty:
-        f_coppa = df_coppa[
-            (df_coppa['Status'] == 'FINISHED') & 
-            (
+        if 'Status' in df_coppa.columns:
+            f_coppa = df_coppa[
+                (df_coppa['Status'] == 'FINISHED') & 
+                (
+                    (df_coppa['HomeTeam'].str.strip().str.lower() == squadra_lim) | 
+                    (df_coppa['AwayTeam'].str.strip().str.lower() == squadra_lim)
+                )
+            ]
+        else:
+            f_coppa = df_coppa[
                 (df_coppa['HomeTeam'].str.strip().str.lower() == squadra_lim) | 
                 (df_coppa['AwayTeam'].str.strip().str.lower() == squadra_lim)
-            )
-        ]
+            ]
         if len(f_coppa) > 0:
             return f_coppa
             
@@ -124,7 +129,7 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     forma_casa = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale)
     forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
 
-    # FallboaCk a cascata dinamico basato sul nome (hash deterministico) per squadre totalmente nuove
+    # Fallback a cascata dinamico basato sul nome (hash deterministico) per squadre totalmente nuove
     if forma_casa.empty:
         seed_c = sum(ord(c) for c in squadra_casa)
         fattore_c = 0.8 + (seed_c % 45) / 100.0  # Variazione unica da 0.80 a 1.25
