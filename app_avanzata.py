@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -209,7 +208,7 @@ def carica_dati_api_europee(codice_competizione, api_key):
         return None
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico con Parametri Dinamici, Ordinamento Decrescente & Coppe Europee")
+st.caption("Modello Statistico Completo con Ordinamento Decrescente per Probabilità")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -282,30 +281,71 @@ else:
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
+        # 1X2 Ordinato in modo decrescente
+        mercato_1x2 = [("1 (Casa)", modello['prob_1']), ("X (Pareggio)", modello['prob_X']), ("2 (Trasferta)", modello['prob_2'])]
+        mercato_1x2_sort = sorted(mercato_1x2, key=lambda x: x[1], reverse=True)
+        
         c1, c2, c3 = st.columns(3)
-        c1.metric("1 (Casa)", f"{modello['prob_1']:.1f}%")
-        c2.metric("X (Pareggio)", f"{modello['prob_X']:.1f}%")
-        c3.metric("2 (Trasferta)", f"{modello['prob_2']:.1f}%")
+        c1.metric(mercato_1x2_sort[0][0], f"{mercato_1x2_sort[0][1]:.1f}%")
+        c2.metric(mercato_1x2_sort[1][0], f"{mercato_1x2_sort[1][1]:.1f}%")
+        c3.metric(mercato_1x2_sort[2][0], f"{mercato_1x2_sort[2][1]:.1f}%")
         
         st.divider()
         
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("**⚽ Goal / No Goal**")
-            st.write(f"- Goal: **{modello['prob_goal']:.1f}%**")
-            st.write(f"- No Goal: **{modello['prob_nogoal']:.1f}%**")
+            st.markdown("**⚽ Goal / No Goal (Ordinati)**")
+            mercato_gg = [("Goal", modello['prob_goal']), ("No Goal", modello['prob_nogoal'])]
+            for label, p in sorted(mercato_gg, key=lambda x: x[1], reverse=True):
+                st.write(f"- {label}: **{p:.1f}%**")
+                
         with col_b:
-            st.markdown("**📉 Under / Over**")
-            for soglia, prob in sorted(modello['prob_under'].items(), key=lambda x: x[1], reverse=True):
-                st.write(f"- Under {soglia}: **{prob:.1f}%** | Over {soglia}: **{100-prob:.1f}%**")
+            st.markdown("**📉 Under / Over (Ordinati)**")
+            oo_list = []
+            for soglia, prob_u in modello['prob_under'].items():
+                oo_list.append((f"Under {soglia}", prob_u))
+                oo_list.append((f"Over {soglia}", 100 - prob_u))
+            for label, p in sorted(oo_list, key=lambda x: x[1], reverse=True):
+                st.write(f"- {label}: **{p:.1f}%**")
 
         st.divider()
 
-        st.markdown("**🔥 Top Risultati Esatti (Ordinati per % decrescente)**")
-        top_risultati = modello['risultati'][:5]
+        col_c, col_d = st.columns(2)
+        with col_c:
+            st.markdown("**🏠 Multigol Casa (Ordinati)**")
+            mg_c_sort = sorted(modello['multigol_casa'].items(), key=lambda x: x[1], reverse=True)
+            for k, v in mg_c_sort:
+                st.write(f"- Casa {k}: **{v:.1f}%**")
+                
+        with col_d:
+            st.markdown("**✈️ Multigol Ospite (Ordinati)**")
+            mg_t_sort = sorted(modello['multigol_trasf'].items(), key=lambda x: x[1], reverse=True)
+            for k, v in mg_t_sort:
+                st.write(f"- Ospite {k}: **{v:.1f}%**")
+
+        st.divider()
+
+        st.markdown("**🔥 Combo Preferite (Ordinate)**")
+        combo_labels = {
+            "1 + Goal": modello['combo']['1_e_gol'],
+            "1 + Over 2.5": modello['combo']['1_e_over25'],
+            "X + Under 2.5": modello['combo']['x_e_under25'],
+            "2 + Goal": modello['combo']['2_e_gol']
+        }
+        combo_sort = sorted(combo_labels.items(), key=lambda x: x[1], reverse=True)
+        cc1, cc2 = st.columns(2)
+        cc1.write(f"- {combo_sort[0][0]}: **{combo_sort[0][1]:.1f}%**")
+        cc1.write(f"- {combo_sort[1][0]}: **{combo_sort[1][1]:.1f}%**")
+        cc2.write(f"- {combo_sort[2][0]}: **{combo_sort[2][1]:.1f}%**")
+        cc2.write(f"- {combo_sort[3][0]}: **{combo_sort[3][1]:.1f}%**")
+
+        st.divider()
+
+        st.markdown("**🎯 Risultati Esatti Top (Ordinati per % decrescente)**")
+        top_risultati = modello['risultati'][:6]
         for tr in top_risultati:
             st.write(f"- Risultato **{tr['res']}** ({tr['segno']}): **{tr['p']:.1f}%**")
 
         st.divider()
-        st.markdown("**🎯 Statistiche Match (Stimate)**")
+        st.markdown("**📌 Statistiche Match (Angoli & Tiri stimati)**")
         st.info(f"Angoli Totali Stimati: **{modello['angoli_stimati']}** | Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**")
