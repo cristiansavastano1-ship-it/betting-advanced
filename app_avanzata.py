@@ -52,35 +52,86 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
     tot = pesi.sum()
     return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
 
-def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, data_riferimento=None):
-    giocate_validi = giocate.dropna(subset=['FTHG', 'FTAG'])
-    if len(giocate_validi) < 5: return None
+def scarica_csv_robusto(url):
+    try:
+        resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
+        resp.raise_for_status()
+        return pd.read_csv(io.StringIO(resp.text)), None
+    except Exception as e:
+        return None, str(e)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carica_dati_campionato(id_fd):
+    codice_corrente, codice_precedente = codici_stagione()
+    frames = []
+    for codice in [codice_precedente, codice_corrente]:
+        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
+        df, _ = scarica_csv_robusto(url)
+        if df is not None:
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+    if frames:
+        dati = pd.concat(frames, ignore_index=True, sort=False)
+        dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
+        return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
+    return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carica_tutti_i_campionati():
+    tutti_dati = []
+    for c_info in CAMPIONATI_DOMESTICI.values():
+        df = carica_dati_campionato(c_info["id_fd"])
+        if df is not None:
+            tutti_dati.append(df)
+    if tutti_dati:
+        return pd.concat(tutti_dati, ignore_index=True, sort=False)
+    return pd.DataFrame()
+
+def trova_storico_squadra(squadra, df_coppa, df_globale):
+    # Cerca prima nello storico della coppa
+    squadra_lim = squadra.strip().lower()
+    f_coppa = df_coppa[
+        (df_coppa['HomeTeam'].str.strip().str.lower() == squadra_lim) | 
+        (df_coppa['AwayTeam'].str.strip().str.lower() == squadra_lim)
+    ]
+    if len(f_coppa) >= 2:
+        return f_coppa
     
-    if data_riferimento is None or pd.isna(data_riferimento):
-        data_riferimento = giocate_validi['Date_parsed'].max()
+    # Fallback sullo storico globale dei campionati nazionali se non basta
+    if not df_globale.empty:
+        f_glob = df_globale[
+            (df_globale['HomeTeam'].str.strip().str.lower().str.contains(squadra_lim[:4])) | 
+            (df_globale['AwayTeam'].str.strip().str.lower().str.contains(squadra_lim[:4]))
+        ]
+        if not f_glob.empty:
+            return f_glob
+            
+    return f_coppa
+
+def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, df_globale):
+    giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
+    
+    data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
 
     m_gol_casa = media_pesata_decadimento(giocate_validi, 'FTHG', data_riferimento, emivita) or 1.5
     m_gol_trasf = media_pesata_decadimento(giocate_validi, 'FTAG', data_riferimento, emivita) or 1.1
 
-    forma_casa = giocate_validi[giocate_validi['HomeTeam'].str.strip().str.lower() == squadra_casa.strip().lower()]
-    forma_trasf = giocate_validi[giocate_validi['AwayTeam'].str.strip().str.lower() == squadra_trasferta.strip().lower()]
+    forma_casa = trova_storico_squadra(squadra_casa, giocate_coppa, df_globale)
+    forma_trasf = trova_storico_squadra(squadra_trasferta, giocate_coppa, df_globale)
 
-    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) if not forma_casa.empty else None
-    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) if not forma_casa.empty else None
-    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) if not forma_trasf.empty else None
-    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) if not forma_trasf.empty else None
+    if forma_casa.empty or forma_trasf.empty:
+        return None
 
-    if gf_casa_rec is None: gf_casa_rec = m_gol_casa
-    if gs_casa_rec is None: gs_casa_rec = m_gol_trasf
-    if gf_trasf_rec is None: gf_trasf_rec = m_gol_trasf
-    if gs_trasf_rec is None: gs_trasf_rec = m_gol_casa
+    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) or m_gol_casa
+    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) or m_gol_trasf
+    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) or m_gol_trasf
+    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) or m_gol_casa
 
     tiri_casa = (media_ewma(forma_casa['HST'], ewma_span) if 'HST' in forma_casa.columns and not forma_casa['HST'].dropna().empty else 4.0) or 4.0
     corner_casa = (media_ewma(forma_casa['HC'], ewma_span) if 'HC' in forma_casa.columns and not forma_casa['HC'].dropna().empty else 5.0) or 5.0
     tiri_trasf = (media_ewma(forma_trasf['AST'], ewma_span) if 'AST' in forma_trasf.columns and not forma_trasf['AST'].dropna().empty else 3.5) or 3.5
     corner_trasf = (media_ewma(forma_trasf['AC'], ewma_span) if 'AC' in forma_trasf.columns and not forma_trasf['AC'].dropna().empty else 4.5) or 4.5
 
-    # Calcolo lambda offensivo e difensivo specifico per il match
     attacco_casa = gf_casa_rec / max(0.1, m_gol_casa)
     difesa_trasf = gs_trasf_rec / max(0.1, m_gol_trasf)
     attacco_trasf = gf_trasf_rec / max(0.1, m_gol_trasf)
@@ -141,31 +192,7 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
         "tiri_stimati": f"{tiri_casa + tiri_trasf:.1f}"
     }
 
-def scarica_csv_robusto(url):
-    try:
-        resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-        resp.raise_for_status()
-        return pd.read_csv(io.StringIO(resp.text)), None
-    except Exception as e:
-        return None, str(e)
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def carica_dati_campionato(id_fd):
-    codice_corrente, codice_precedente = codici_stagione()
-    frames = []
-    for codice in [codice_precedente, codice_corrente]:
-        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
-        df, _ = scarica_csv_robusto(url)
-        if df is not None:
-            df.columns = df.columns.str.strip()
-            frames.append(df)
-    if frames:
-        dati = pd.concat(frames, ignore_index=True, sort=False)
-        dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
-        return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
-    return None
-
-@st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
     df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
     if df is not None:
@@ -184,6 +211,8 @@ def carica_dati_api_europee(codice_competizione, api_key):
     url_matches = f"https://api.football-data.org/v4/competitions/{codice_competizione}/matches"
     try:
         resp = requests.get(url_matches, headers=headers, timeout=15)
+        if resp.status_code == 403:
+            return "ERRORE_403"
         resp.raise_for_status()
         data = resp.json()
         matches = data.get("matches", [])
@@ -211,14 +240,14 @@ def carica_dati_api_europee(codice_competizione, api_key):
         df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
         return df.sort_values('Date_parsed').reset_index(drop=True)
     except Exception as e:
-        return None
+        return str(e)
 
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Avanzato con Tabelle Dinamiche in Ordine Decrescente")
+st.caption("Modello Statistico Avanzato con Fallback Intelligente")
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
-    api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password", help="Necessaria per Champions, Europa e Conference League")
+    api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password", help="Inserisci la tua chiave API.")
     st.divider()
     rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
     ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
@@ -250,6 +279,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     for _, r in storiche.iterrows():
         opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
         mappa_partite.append(r.to_dict())
+    df_globale = pd.DataFrame()
         
 else:
     if not api_key_input:
@@ -259,11 +289,20 @@ else:
     info = CAMPIONATI_COPPE[campionato]
     code_api = info["code"]
     
-    with st.spinner("Connessione alle API delle Coppe Europee..."):
-        dati = carica_dati_api_europee(code_api, api_key_input)
+    with st.spinner("Connessione alle API delle Coppe e caricamento dati di supporto..."):
+        risultato_api = carica_dati_api_europee(code_api, api_key_input)
+        df_globale = carica_tutti_i_campionati()
         
+    if isinstance(risultato_api, str) and risultato_api == "ERRORE_403":
+        st.error("❌ **Accesso Negato (Errore 403)**: La tua chiave API gratuita non ha accesso alle Coppe Europee.")
+        st.stop()
+    elif isinstance(risultato_api, str):
+        st.error(f"Errore di connessione API: {risultato_api}")
+        st.stop()
+    
+    dati = risultato_api
     if dati is None or len(dati) == 0:
-        st.error("Errore nel recupero dati API o chiave non valida.")
+        st.error("Nessun dato trovato per questa competizione.")
         st.stop()
         
     dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
@@ -279,20 +318,19 @@ else:
     for _, r in dati_storico.tail(10).iterrows():
         opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
-        
-    dati = dati_storico
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile al momento.")
+    st.warning("Nessuna partita disponibile al moment.")
 else:
     scelta = st.selectbox("Seleziona Partita", opzioni_partite)
     idx_sel = opzioni_partite.index(scelta)
     partita_sel = mappa_partite[idx_sel]
     
-    modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], rho_val, ewma_span_val, emivita_val)
+    dati_coppa_storico = dati[dati['Status'] == 'FINISHED'].copy() if scelta_categoria != "Campionati Nazionali (Gratuiti)" else dati
+    modello = calcola_modello_completo(dati_coppa_storico, partita_sel['HomeTeam'], partita_sel['AwayTeam'], rho_val, ewma_span_val, emivita_val, df_globale)
     
     if modello is None:
-        st.error(f"Impossibile elaborare il match {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}: dati storici insufficienti per una o entrambe le squadre.")
+        st.warning(f"⚠️ Impossibile reperire uno storico sufficiente per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}** né in Europa né nei campionati nazionali supportati.")
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
