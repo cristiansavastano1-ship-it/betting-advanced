@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -52,30 +53,41 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
     return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
 
 def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma_span, emivita, data_riferimento=None):
-    n_storico = len(giocate)
-    if n_storico < 5: return None
+    giocate_validi = giocate.dropna(subset=['FTHG', 'FTAG'])
+    if len(giocate_validi) < 5: return None
+    
     if data_riferimento is None or pd.isna(data_riferimento):
-        data_riferimento = giocate['Date_parsed'].max()
+        data_riferimento = giocate_validi['Date_parsed'].max()
 
-    m_gol_casa = media_pesata_decadimento(giocate, 'FTHG', data_riferimento, emivita)
-    m_gol_trasf = media_pesata_decadimento(giocate, 'FTAG', data_riferimento, emivita)
-    if m_gol_casa is None or m_gol_trasf is None: return None
+    m_gol_casa = media_pesata_decadimento(giocate_validi, 'FTHG', data_riferimento, emivita) or 1.5
+    m_gol_trasf = media_pesata_decadimento(giocate_validi, 'FTAG', data_riferimento, emivita) or 1.1
 
-    forma_casa = giocate[giocate['HomeTeam'] == squadra_casa]
-    forma_trasf = giocate[giocate['AwayTeam'] == squadra_trasferta]
+    forma_casa = giocate_validi[giocate_validi['HomeTeam'].str.strip().str.lower() == squadra_casa.strip().lower()]
+    forma_trasf = giocate_validi[giocate_validi['AwayTeam'].str.strip().str.lower() == squadra_trasferta.strip().lower()]
 
-    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) or m_gol_casa
-    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) or m_gol_trasf
-    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) or m_gol_trasf
-    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) or m_gol_casa
+    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) if not forma_casa.empty else None
+    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) if not forma_casa.empty else None
+    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) if not forma_trasf.empty else None
+    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) if not forma_trasf.empty else None
+
+    if gf_casa_rec is None: gf_casa_rec = m_gol_casa
+    if gs_casa_rec is None: gs_casa_rec = m_gol_trasf
+    if gf_trasf_rec is None: gf_trasf_rec = m_gol_trasf
+    if gs_trasf_rec is None: gs_trasf_rec = m_gol_casa
 
     tiri_casa = (media_ewma(forma_casa['HST'], ewma_span) if 'HST' in forma_casa.columns and not forma_casa['HST'].dropna().empty else 4.0) or 4.0
     corner_casa = (media_ewma(forma_casa['HC'], ewma_span) if 'HC' in forma_casa.columns and not forma_casa['HC'].dropna().empty else 5.0) or 5.0
     tiri_trasf = (media_ewma(forma_trasf['AST'], ewma_span) if 'AST' in forma_trasf.columns and not forma_trasf['AST'].dropna().empty else 3.5) or 3.5
     corner_trasf = (media_ewma(forma_trasf['AC'], ewma_span) if 'AC' in forma_trasf.columns and not forma_trasf['AC'].dropna().empty else 4.5) or 4.5
 
-    lam_c = (gf_casa_rec / max(0.1, m_gol_casa)) * (gs_trasf_rec / max(0.1, m_gol_trasf)) * m_gol_casa
-    lam_t = (gf_trasf_rec / max(0.1, m_gol_trasf)) * (gs_casa_rec / max(0.1, m_gol_casa)) * m_gol_trasf
+    # Calcolo lambda offensivo e difensivo specifico per il match
+    attacco_casa = gf_casa_rec / max(0.1, m_gol_casa)
+    difesa_trasf = gs_trasf_rec / max(0.1, m_gol_trasf)
+    attacco_trasf = gf_trasf_rec / max(0.1, m_gol_trasf)
+    difesa_casa = gs_casa_rec / max(0.1, m_gol_casa)
+
+    lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
+    lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
 
     prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
     prob_goal, prob_nogoal = 0.0, 0.0
@@ -254,24 +266,20 @@ else:
         st.error("Errore nel recupero dati API o chiave non valida.")
         st.stop()
         
-    # Separiamo lo storico (partite già giocate con risultato) dalle partite future
     dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
     dati_future = dati[dati['Status'] != 'FINISHED'].copy()
     
     opzioni_partite = []
     mappa_partite = []
     
-    # Mettiamo prima le partite future da giocare
     for _, r in dati_future.iterrows():
         opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
         
-    # Poi aggiungiamo le ultime giocate per test/controllo
     for _, r in dati_storico.tail(10).iterrows():
         opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
         
-    # Usiamo lo storico come dataset di riferimento per calcolare la forma e le medie delle coppe
     dati = dati_storico
 
 if not opzioni_partite:
@@ -284,7 +292,7 @@ else:
     modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], rho_val, ewma_span_val, emivita_val)
     
     if modello is None:
-        st.error("Campione insufficiente per elaborare le statistiche di questa partita (assicurati che la squadra abbia abbastanza match storici registrati nella competizione).")
+        st.error(f"Impossibile elaborare il match {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}: dati storici insufficienti per una o entrambe le squadre.")
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
