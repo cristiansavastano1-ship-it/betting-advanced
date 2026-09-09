@@ -2,37 +2,26 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import json
-import os
 import io
-import time
-import pickle
-from datetime import date, datetime
+from datetime import date
 from scipy.stats import poisson
 
 st.set_page_config(page_title="Advanced Betting Model", page_icon="⚽", layout="centered")
 
-# =====================================================================
-# 📊 DATABASE CAMPIONATI (Top 5 + Coppe Europee)
-# =====================================================================
 CAMPIONATI = {
     "Italia - Serie A": {"id_fd": "I1"},
     "Inghilterra - Premier League": {"id_fd": "E0"},
     "Spagna - La Liga": {"id_fd": "SP1"},
     "Germania - Bundesliga": {"id_fd": "D1"},
     "Francia - Ligue 1": {"id_fd": "F1"},
-    "🌍 Champions League": {"id_fdorg": "CL", "solo_previsione": True},
-    "🌍 Europa League": {"id_fdorg": "EL", "solo_previsione": True},
+    "🌍 Champions League (solo previsione)": {"id_fdorg": "CL", "solo_previsione": True},
+    "🌍 Europa League (solo previsione)": {"id_fdorg": "EL", "solo_previsione": True},
 }
 
-FILE_CLV_PERSONALE = "clv_personale_avanzato.json"
 EWMA_SPAN = 6
 GIORNI_EMIVITA_DECADIMENTO = 180
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-# =====================================================================
-# 🧠 MOTORE MATEMATICO & CALCOLI AVANZATI
-# =====================================================================
 def codici_stagione(oggi=None):
     oggi = oggi or date.today()
     anno_inizio_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
@@ -83,7 +72,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data
     gf_trasf_rec = media_ewma(forma_trasf['FTAG']) or m_gol_trasf
     gs_trasf_rec = media_ewma(forma_trasf['FTHG']) or m_gol_casa
 
-    # Metriche secondarie (Tiri / Angoli)
     tiri_casa = (media_ewma(forma_casa['HST']) if 'HST' in forma_casa.columns else None) or 4.0
     corner_casa = (media_ewma(forma_casa['HC']) if 'HC' in forma_casa.columns else None) or 5.0
     tiri_trasf = (media_ewma(forma_trasf['AST']) if 'AST' in forma_trasf.columns else None) or 3.5
@@ -92,7 +80,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data
     lam_c = (gf_casa_rec / max(0.1, m_gol_casa)) * (gs_trasf_rec / max(0.1, m_gol_trasf)) * m_gol_casa
     lam_t = (gf_trasf_rec / max(0.1, m_gol_trasf)) * (gs_casa_rec / max(0.1, m_gol_casa)) * m_gol_trasf
 
-    # Poisson Matrix & Mercati
     risultati = []
     prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
     prob_goal, prob_nogoal = 0.0, 0.0
@@ -101,7 +88,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data
     
     multigol_casa = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     multigol_trasf = {"1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    
     combo_stats = {"1_e_gol": 0.0, "1_e_over25": 0.0, "x_e_under25": 0.0, "2_e_gol": 0.0}
 
     for gc in range(8):
@@ -119,12 +105,10 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data
             for l in limiti_under:
                 if gc + gt < l: prob_under[l] += p
                 
-            # Multigol Casa / Ospite
             for mg_key, (mi_c, ma_c) in [("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
                 if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
                 if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
 
-            # Combo
             if segno == '1' and gc > 0 and gt > 0: combo_stats["1_e_gol"] += p
             if segno == '1' and (gc + gt) > 2.5: combo_stats["1_e_over25"] += p
             if segno == 'X' and (gc + gt) < 2.5: combo_stats["x_e_under25"] += p
@@ -152,9 +136,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, data
         "tiri_stimati": f"{tiri_casa + tiri_trasf:.1f}", "risultati": risultati
     }
 
-# =====================================================================
-# 📥 DOWNLOAD & CACHE DATI
-# =====================================================================
 def scarica_csv_robusto(url):
     try:
         resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
@@ -180,6 +161,34 @@ def carica_dati_campionato(id_fd):
     return None
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def carica_dati_fdorg(codice_comp, api_key):
+    if not api_key: return None
+    anno_corrente, anno_precedente = anni_stagione()
+    headers = {"X-Auth-Token": api_key}
+    frames = []
+    for anno in [anno_precedente, anno_corrente]:
+        url = f"https://api.football-data.org/v4/competitions/{codice_comp}/matches?season={anno}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                dati_json = resp.json()
+                righe = []
+                for m in dati_json.get("matches", []):
+                    finita = m.get("status") == "FINISHED"
+                    righe.append({
+                        "HomeTeam": m["homeTeam"]["name"], "AwayTeam": m["awayTeam"]["name"],
+                        "Date": m["utcDate"][:10],
+                        "FTHG": m["score"]["fullTime"]["home"] if finita else np.nan,
+                        "FTAG": m["score"]["fullTime"]["away"] if finita else np.nan,
+                    })
+                if righe: frames.append(pd.DataFrame(righe))
+        except Exception: pass
+    if not frames: return None
+    dati = pd.concat(frames, ignore_index=True, sort=False)
+    dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce')
+    return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
     df, _ = scarica_csv_robusto("https://www.football-data.co.uk/fixtures.csv")
     if df is not None:
@@ -192,51 +201,62 @@ def carica_fixture_future(id_fd):
             return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
     return pd.DataFrame()
 
-# =====================================================================
-# 🖥️ INTERFACCIA STREAMLIT
-# =====================================================================
 st.title("⚽ Advanced Pro Betting Analyzer")
-st.caption("Modello Statistico Completo: 1X2, Under/Over, Multigol, Angoli, Tiri & Combo con Variazione Quote")
+st.caption("Modello Statistico Completo: 1X2, Under/Over, Multigol, Angoli, Tiri & Combo")
 
 if "rho" not in st.session_state:
     st.session_state.rho = -0.10
 
+with st.sidebar:
+    api_key_fdorg = st.text_input("API Key football-data.org (per Coppe)", type="password")
+
 campionato = st.selectbox("Seleziona Torneo", list(CAMPIONATI.keys()))
 info = CAMPIONATI[campionato]
-id_fd = info["id_fd"]
+solo_previsione = info.get("solo_previsione", False)
 
 with st.spinner("Caricamento dataset in corso..."):
-    dati = carica_dati_campionato(id_fd)
-    fixture_future = carica_fixture_future(id_fd)
+    if solo_previsione:
+        dati = carica_dati_fdorg(info["id_fdorg"], api_key_fdorg)
+        fixture_future = pd.DataFrame()
+        if dati is not None:
+            fixture_future = dati[dati['FTHG'].isna()].copy()
+            dati = dati[dati['FTHG'].notna()].copy()
+    else:
+        id_fd = info["id_fd"]
+        dati = carica_dati_campionato(id_fd)
+        fixture_future = carica_fixture_future(id_fd)
 
-if dati is None:
-    st.error("Errore di caricamento dati per questo campionato.")
+if dati is None or len(dati) == 0:
+    st.error("Impossibile scaricare i dati. Se usi le coppe inserisci la chiave API, oppure il sito principale è temporaneamente occupato.")
     st.stop()
 
 opzioni_partite = []
 mappa_partite = []
-for _, r in fixture_future.iterrows():
-    opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
-    mappa_partite.append(r.to_dict())
 
-for _, r in dati.tail(10).iterrows():
-    opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r['HomeTeam']} vs {r['AwayTeam']}")
+if not fixture_future.empty:
+    for _, r in fixture_future.iterrows():
+        opzioni_partite.append(f"FUTURA ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
+        mappa_partite.append(r.to_dict())
+
+storiche = dati[dati['FTHG'].notna()].tail(15)
+for _, r in storiche.iterrows():
+    opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
     mappa_partite.append(r.to_dict())
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile.")
+    st.warning("Nessuna partita disponibile al momento.")
 else:
     scelta = st.selectbox("Seleziona Partita", opzioni_partite)
-    partita_sel = mappa_partite[opzioni_partite.index(scelta)]
+    idx_sel = opzioni_partite.index(scelta)
+    partita_sel = mappa_partite[idx_sel]
     
     modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], st.session_state.rho)
     
     if modello is None:
-        st.error("Campione insufficiente per elaborare le statistiche.")
+        st.error("Campione insufficiente per elaborare le statistiche di questa partita.")
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
         
-        # 1X2 & Quote Mercato
         c1, c2, c3 = st.columns(3)
         c1.metric("1 (Casa)", f"{modello['prob_1']:.1f}%")
         c2.metric("X (Pareggio)", f"{modello['prob_X']:.1f}%")
@@ -244,11 +264,10 @@ else:
         
         st.divider()
         
-        # Sotto-seggi: Under/Over & Goal/No Goal
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("**⚽ Goal / No Goal**")
-            st.write(f"- Entrambe a segno (Goal): **{modello['prob_goal']:.1f}%**")
+            st.write(f"- Goal: **{modello['prob_goal']:.1f}%**")
             st.write(f"- No Goal: **{modello['prob_nogoal']:.1f}%**")
         with col_b:
             st.markdown("**📉 Under / Over**")
@@ -257,7 +276,6 @@ else:
 
         st.divider()
 
-        # Multigol Casa / Ospite
         col_c, col_d = st.columns(2)
         with col_c:
             st.markdown("**🏠 Multigol Casa**")
@@ -270,7 +288,6 @@ else:
 
         st.divider()
 
-        # Combo & Statistiche Secondarie (Angoli/Tiri)
         st.markdown("**🔥 Combo Preferite**")
         cc1, cc2 = st.columns(2)
         cc1.write(f"- 1 + Goal: **{modello['combo']['1_e_gol']:.1f}%**")
