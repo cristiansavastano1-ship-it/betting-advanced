@@ -334,6 +334,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
         opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
         mappa_partite.append(r.to_dict())
     df_globale = pd.DataFrame()
+    is_coppa = False
         
 else:
     if not api_key_input:
@@ -372,6 +373,7 @@ else:
     for _, r in dati_storico.tail(10).iterrows():
         opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
+    is_coppa = True
 
 if not opzioni_partite:
     st.warning("Nessuna partita disponibile al momento.")
@@ -402,27 +404,42 @@ else:
         }, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
 
-        # ----------------- ANALISI VALUE BET AUTOMATICA (SENZA INPUT) -----------------
-        st.markdown("### 💰 Controllo Value Bet (Automatico da Quote Reali)")
-        
-        q_1 = estrai_quota_sicura(partita_sel, 'B365H', 0.0)
-        q_x = estrai_quota_sicura(partita_sel, 'B365D', 0.0)
-        q_2 = estrai_quota_sicura(partita_sel, 'B365A', 0.0)
+        # ----------------- ANALISI VALUE BET (CAMPIONATI VS COPPE) -----------------
+        if not is_coppa:
+            st.markdown("### 💰 Controllo Value Bet (Automatico da Quote Reali)")
+            q_1 = estrai_quota_sicura(partita_sel, 'B365H', 0.0)
+            q_x = estrai_quota_sicura(partita_sel, 'B365D', 0.0)
+            q_2 = estrai_quota_sicura(partita_sel, 'B365A', 0.0)
 
-        if q_1 > 0 and q_x > 0 and q_2 > 0:
-            ev_1 = (modello['prob_1'] / 100.0) * q_1
-            ev_x = (modello['prob_X'] / 100.0) * q_x
-            ev_2 = (modello['prob_2'] / 100.0) * q_2
+            if q_1 > 0 and q_x > 0 and q_2 > 0:
+                ev_1 = (modello['prob_1'] / 100.0) * q_1
+                ev_x = (modello['prob_X'] / 100.0) * q_x
+                ev_2 = (modello['prob_2'] / 100.0) * q_2
 
-            dati_ev = [
-                {"Segno": "1 (Casa)", "Quota Reale": q_1, "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
-                {"Segno": "X (Pareggio)", "Quota Reale": q_x, "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
-                {"Segno": "2 (Trasferta)", "Quota Reale": q_2, "Valutazione": "🔥 ALTO VALORE" if ev_2 > 1.05 else ("📈 Leggero Valore" if ev_2 > 1.0 else "Nessun Valore")}
-            ]
-            df_ev_mostra = pd.DataFrame(dati_ev)
-            st.dataframe(df_ev_mostra, use_container_width=True, hide_index=True)
+                dati_ev = [
+                    {"Segno": "1 (Casa)", "Quota Reale": q_1, "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
+                    {"Segno": "X (Pareggio)", "Quota Reale": q_x, "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
+                    {"Segno": "2 (Trasferta)", "Quota Reale": q_2, "Valutazione": "🔥 ALTO VALORE" if ev_2 > 1.05 else ("📈 Leggero Valore" if ev_2 > 1.0 else "Nessun Valore")}
+                ]
+                df_ev_mostra = pd.DataFrame(dati_ev)
+                st.dataframe(df_ev_mostra, use_container_width=True, hide_index=True)
+            else:
+                st.info("ℹ️ Quote dei bookmaker non disponibili per questa specifica partita.")
         else:
-            st.info("ℹ️ Quote dei bookmaker non disponibili per questa specifica partita (comune nelle partite future delle Coppe o in alcuni anticipi/posticipi non ancora quotati).")
+            st.markdown("### 🎯 Quota Equa Statistica (Coppe Europee)")
+            st.caption("Essendo una coppa europea, il modello calcola la **Quota Equa (Fair Odds)** basata sulla probabilità matematica pura. Cerca sui bookmaker quote superiori a questi valori per trovare valore.")
+            
+            q_fair_1 = 100.0 / modello['prob_1'] if modello['prob_1'] > 0 else 0.0
+            q_fair_x = 100.0 / modello['prob_X'] if modello['prob_X'] > 0 else 0.0
+            q_fair_2 = 100.0 / modello['prob_2'] if modello['prob_2'] > 0 else 0.0
+
+            dati_fair = [
+                {"Segno": "1 (Casa)", "Probabilità": f"{modello['prob_1']:.1f}%", "Quota Equa Minima": f"{q_fair_1:.2f}"},
+                {"Segno": "X (Pareggio)", "Probabilità": f"{modello['prob_X']:.1f}%", "Quota Equa Minima": f"{q_fair_x:.2f}"},
+                {"Segno": "2 (Trasferta)", "Probabilità": f"{modello['prob_2']:.1f}%", "Quota Equa Minima": f"{q_fair_2:.2f}"}
+            ]
+            df_fair_mostra = pd.DataFrame(dati_fair)
+            st.dataframe(df_fair_mostra, use_container_width=True, hide_index=True)
         # -----------------------------------------------------------------------------
 
         col_a, col_b = st.columns(2)
