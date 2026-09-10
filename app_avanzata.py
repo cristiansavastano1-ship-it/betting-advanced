@@ -3,10 +3,11 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import time
 from datetime import date
 from scipy.stats import poisson
 
-st.set_page_config(page_title="COMBO Betting Pro", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="COMBO - Advanced Betting Model", page_icon="⚽", layout="centered")
 
 CAMPIONATI_DOMESTICI = {
     "Italia - Serie A": {"id_fd": "I1"},
@@ -22,7 +23,30 @@ CAMPIONATI_COPPE = {
     "🌍 UEFA Conference League": {"code": "UECL"},
 }
 
-HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+K_SHRINKAGE = 10  # stesso principio già validato nell'App Risultati Fissi
+
+
+# =====================================================================
+# 🔧 FIX #4 — MATCHING SQUADRE "MORBIDO"
+# Prima: confronto testuale esatto. Con le coppe europee (nomi da
+# football-data.org, es. "Manchester United FC") contro i nomi domestici
+# (es. "Man United") il match esatto falliva spesso in silenzio, facendo
+# scattare il generatore di dati finti (ora rimosso, vedi FIX #1).
+# =====================================================================
+def normalizza_nome_squadra(nome):
+    nome = str(nome)
+    for suffisso in [" FC", " CF", " AFC", " AC", " SC", " CFC"]:
+        nome = nome.replace(suffisso, "")
+    return nome.strip().lower()
+
+
+def nomi_corrispondono(a, b):
+    na, nb = normalizza_nome_squadra(a), normalizza_nome_squadra(b)
+    return na == nb or na in nb or nb in na
+
 
 def codici_stagione(oggi=None):
     oggi = oggi or date.today()
@@ -31,6 +55,7 @@ def codici_stagione(oggi=None):
     fmt = lambda a: f"{a % 100:02d}{(a + 1) % 100:02d}"
     return fmt(anno_inizio_corrente), fmt(anno_inizio_precedente)
 
+
 def tau_dixon_coles(gc, gt, lc, lt, rho):
     if gc == 0 and gt == 0: return 1 - (lc * lt * rho)
     elif gc == 0 and gt == 1: return 1 + (lc * rho)
@@ -38,12 +63,15 @@ def tau_dixon_coles(gc, gt, lc, lt, rho):
     elif gc == 1 and gt == 1: return 1 - rho
     return 1.0
 
+
 def media_ewma(serie, span):
     serie = serie.dropna()
     if len(serie) == 0: return None
     return serie.ewm(span=span, min_periods=1).mean().iloc[-1]
 
+
 def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
+    if colonna not in df.columns: return None
     sub = df[[colonna, 'Date_parsed']].dropna()
     if len(sub) == 0: return None
     giorni = (data_riferimento - sub['Date_parsed']).dt.days.clip(lower=0)
@@ -51,13 +79,33 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
     tot = pesi.sum()
     return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
 
-def scarica_csv_robusto(url):
-    try:
-        resp = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-        resp.raise_for_status()
-        return pd.read_csv(io.StringIO(resp.text)), None
-    except Exception as e:
-        return None, str(e)
+
+# =====================================================================
+# 🔧 Download robusto: header da browser + retry + fallback www/no-www
+# (stessa correzione già validata nell'App Risultati Fissi, dopo il
+# disservizio di football-data.co.uk causato dal blocco geografico su
+# "www" per il traffico non-UK)
+# =====================================================================
+def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
+    varianti_url = [url]
+    if "://www." in url:
+        varianti_url.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        varianti_url.append(url.replace("://", "://www."))
+
+    ultimo_errore = None
+    for tentativo in range(tentativi):
+        for url_prova in varianti_url:
+            try:
+                resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
+                resp.raise_for_status()
+                return pd.read_csv(io.StringIO(resp.text)), None
+            except Exception as e:
+                ultimo_errore = str(e)
+        if tentativo < tentativi - 1:
+            time.sleep(attesa_secondi)
+    return None, ultimo_errore
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_campionato(id_fd):
@@ -75,6 +123,7 @@ def carica_dati_campionato(id_fd):
         return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
     return None
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_tutti_i_campionati():
     tutti_dati = []
@@ -86,105 +135,130 @@ def carica_tutti_i_campionati():
         return pd.concat(tutti_dati, ignore_index=True, sort=False)
     return pd.DataFrame()
 
-def normalizza_nome(nome):
-    if not isinstance(nome, str): return ""
-    return nome.lower().replace("fc", "").replace("cf", "").replace("united", "utd").replace(".", "").strip()
 
-def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale, data_limite):
-    s_norm = normalizza_nome(squadra)
-    
-    def filtra_df(df):
-        if df is None or df.empty: return pd.DataFrame()
-        sub = df[df['Date_parsed'] < data_limite].copy()
-        if 'Status' in sub.columns:
-            sub = sub[sub['Status'] == 'FINISHED']
-        else:
-            sub = sub.dropna(subset=['FTHG', 'FTAG'])
-            
-        return sub[
-            sub['HomeTeam'].apply(lambda x: s_norm in normalizza_nome(x)) | 
-            sub['AwayTeam'].apply(lambda x: s_norm in normalizza_nome(x))
-        ]
+def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
+    """Matching morbido (FIX #4): prima prova nel dataset della competizione
+    stessa, poi nel dataset globale domestico come fallback."""
+    if df_coppa is not None and not df_coppa.empty:
+        maschera = df_coppa['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
+                   df_coppa['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+        f_coppa = df_coppa[maschera]
+        if len(f_coppa) > 0:
+            return f_coppa
 
-    res = filtra_df(df_coppa)
-    if len(res) >= 3:
-        return res, "Coppa"
-        
-    res_glob = filtra_df(df_globale)
-    if not res_glob.empty:
-        return res_glob, "Globale/Domestico"
-        
-    return res, "Insufficiente"
+    if df_globale is not None and not df_globale.empty:
+        maschera = df_globale['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
+                   df_globale['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+        f_glob = df_globale[maschera]
+        if len(f_glob) > 0:
+            return f_glob
 
-def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale, data_limite):
-    c_norm = normalizza_nome(squadra_casa)
-    t_norm = normalizza_nome(squadra_trasferta)
-    
+    return pd.DataFrame()
+
+
+def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
     frames_tot = []
-    if df_coppa is not None and not df_coppa.empty: frames_tot.append(df_coppa)
-    if df_globale is not None and not df_globale.empty: frames_tot.append(df_globale)
-    if not frames_tot: return pd.DataFrame()
-        
+    if df_coppa is not None and not df_coppa.empty:
+        frames_tot.append(df_coppa)
+    if df_globale is not None and not df_globale.empty:
+        frames_tot.append(df_globale)
+    if not frames_tot:
+        return pd.DataFrame()
+
     df_uni = pd.concat(frames_tot, ignore_index=True, sort=False)
-    df_uni = df_uni[df_uni['Date_parsed'] < data_limite].dropna(subset=['FTHG', 'FTAG'])
-    
-    h2h = df_uni[
-        (
-            (df_uni['HomeTeam'].apply(lambda x: c_norm in normalizza_nome(x)) & df_uni['AwayTeam'].apply(lambda x: t_norm in normalizza_nome(x))) |
-            (df_uni['HomeTeam'].apply(lambda x: t_norm in normalizza_nome(x)) & df_uni['AwayTeam'].apply(lambda x: c_norm in normalizza_nome(x)))
-        )
-    ].copy()
-    
-    return h2h.sort_values('Date_parsed', ascending=False).head(5)
+    if 'FTHG' not in df_uni.columns or 'FTAG' not in df_uni.columns:
+        return pd.DataFrame()
 
-def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, data_partita, rho, ewma_span, emivita, df_globale):
-    data_limite = pd.to_datetime(data_partita) if data_partita else pd.Timestamp(date.today())
-    
-    # Filtro rigoroso No-Look-Ahead sul passato
-    df_storico_valido = giocate_coppa[giocate_coppa['Date_parsed'] < data_limite].dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
-    
-    m_gol_casa = media_pesata_decadimento(df_storico_valido, 'FTHG', data_limite, emivita) or 1.60
-    m_gol_trasf = media_pesata_decadimento(df_storico_valido, 'FTAG', data_limite, emivita) or 1.15
+    maschera_diretto = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa)) & \
+                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta))
+    maschera_inverso = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta)) & \
+                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa))
 
-    forma_casa, fonte_c = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale, data_limite)
-    forma_trasf, fonte_t = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale, data_limite)
+    h2h = df_uni[(df_uni['FTHG'].notna()) & (df_uni['FTAG'].notna()) & (maschera_diretto | maschera_inverso)].copy()
 
-    avvisi = []
-    if fonte_c == "Insufficiente":
-        avvisi.warning(f"⚠️ Storico limitato per **{squadra_casa}**: applicato shrinkage di lega (nessun dato inventato).")
-        forma_casa = pd.DataFrame({'FTHG': [m_gol_casa], 'FTAG': [m_gol_trasf], 'Date_parsed': [data_limite]})
-    if fonte_t == "Insufficiente":
-        avvisi.warning(f"⚠️ Storico limitato per **{squadra_trasferta}**: applicato shrinkage di lega (nessun dato inventato).")
-        forma_trasf = pd.DataFrame({'FTHG': [m_gol_trasf], 'FTAG': [m_gol_casa], 'Date_parsed': [data_limite]})
+    if 'Date_parsed' in h2h.columns:
+        h2h = h2h.sort_values('Date_parsed', ascending=False)
+    return h2h.head(5)
 
-    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) or m_gol_casa
-    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) or m_gol_trasf
-    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) or m_gol_trasf
-    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) or m_gol_casa
 
-    tiri_casa = (media_ewma(forma_casa['HST'], ewma_span) if 'HST' in forma_casa.columns and not forma_casa['HST'].dropna().empty else 4.5)
-    corner_casa = (media_ewma(forma_casa['HC'], ewma_span) if 'HC' in forma_casa.columns and not forma_casa['HC'].dropna().empty else 5.0)
-    tiri_trasf = (media_ewma(forma_trasf['AST'], ewma_span) if 'AST' in forma_trasf.columns and not forma_trasf['AST'].dropna().empty else 4.0)
-    corner_trasf = (media_ewma(forma_trasf['AC'], ewma_span) if 'AC' in forma_trasf.columns and not forma_trasf['AC'].dropna().empty else 4.5)
+# =====================================================================
+# 🔧 FIX #1 — VIA IL GENERATORE DI DATI FINTI, DENTRO VERO SHRINKAGE
+# Prima: se una squadra non aveva partite trovate, il codice INVENTAVA un
+# profilo attacco/difesa calcolato dalla somma dei codici ASCII del nome
+# squadra — un numero pseudo-casuale spacciato per statistica.
+# Ora: quando i dati specifici sono pochi o assenti, la stima converge
+# gradualmente verso la media di lega (shrinkage, stesso principio già
+# validato nell'App Risultati Fissi) invece di inventare un profilo finto.
+# Il chiamante riceve n_casa/n_trasf per mostrare un avviso onesto quando
+# il campione specifico è scarso.
+# =====================================================================
+def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span,
+                              emivita, df_globale, data_riferimento=None):
+    giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
+    if data_riferimento is None:
+        data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
 
-    attacco_casa = gf_casa_rec / max(0.1, m_gol_casa)
-    difesa_trasf = gs_trasf_rec / max(0.1, m_gol_trasf)
-    attacco_trasf = gf_trasf_rec / max(0.1, m_gol_trasf)
-    difesa_casa = gs_casa_rec / max(0.1, m_gol_casa)
+    # Baseline di lega/competizione. Se il campione della competizione è
+    # troppo piccolo (tipico per le coppe a inizio stagione), lo arricchiamo
+    # con il dataset domestico globale per una stima più stabile.
+    base_per_media = giocate_validi
+    if len(giocate_validi) < 20 and df_globale is not None and not df_globale.empty:
+        base_per_media = pd.concat([giocate_validi, df_globale.dropna(subset=['FTHG', 'FTAG'])], ignore_index=True, sort=False)
 
-    lam_c = max(0.1, attacco_casa * difesa_trasf * m_gol_casa)
-    lam_t = max(0.1, attacco_trasf * defesa_casa * m_gol_trasf if 'defesa_casa' in locals() else attacco_trasf * difesa_casa * m_gol_trasf)
+    m_gol_casa = media_pesata_decadimento(base_per_media, 'FTHG', data_riferimento, emivita) or 1.65
+    m_gol_trasf = media_pesata_decadimento(base_per_media, 'FTAG', data_riferimento, emivita) or 1.25
+    m_tiri_casa_lega = media_pesata_decadimento(base_per_media, 'HST', data_riferimento, emivita) or 4.8
+    m_tiri_trasf_lega = media_pesata_decadimento(base_per_media, 'AST', data_riferimento, emivita) or 4.1
+    m_corner_casa_lega = media_pesata_decadimento(base_per_media, 'HC', data_riferimento, emivita) or 5.4
+    m_corner_trasf_lega = media_pesata_decadimento(base_per_media, 'AC', data_riferimento, emivita) or 4.6
+
+    forma_casa = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale)
+    forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
+    n_casa, n_trasf = len(forma_casa), len(forma_trasf)
+
+    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) if n_casa else None
+    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) if n_casa else None
+    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) if n_trasf else None
+    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) if n_trasf else None
+
+    tiri_casa = media_ewma(forma_casa['HST'], ewma_span) if (n_casa and 'HST' in forma_casa.columns) else None
+    corner_casa = media_ewma(forma_casa['HC'], ewma_span) if (n_casa and 'HC' in forma_casa.columns) else None
+    tiri_trasf = media_ewma(forma_trasf['AST'], ewma_span) if (n_trasf and 'AST' in forma_trasf.columns) else None
+    corner_trasf = media_ewma(forma_trasf['AC'], ewma_span) if (n_trasf and 'AC' in forma_trasf.columns) else None
+
+    # Shrinkage: peso -> 0 quando n_casa/n_trasf sono pochi o zero, quindi la
+    # stima converge verso il rapporto neutro 1.0 (= "come la media") invece
+    # di un profilo inventato. Peso -> 1 quando il campione è ampio, quindi ci
+    # si fida del dato specifico della squadra.
+    peso_casa = n_casa / (n_casa + K_SHRINKAGE)
+    peso_trasf = n_trasf / (n_trasf + K_SHRINKAGE)
+
+    rapp_attacco_casa = (gf_casa_rec / max(0.1, m_gol_casa)) if gf_casa_rec is not None else 1.0
+    rapp_difesa_casa = (gs_casa_rec / max(0.1, m_gol_trasf)) if gs_casa_rec is not None else 1.0
+    rapp_attacco_trasf = (gf_trasf_rec / max(0.1, m_gol_trasf)) if gf_trasf_rec is not None else 1.0
+    rapp_difesa_trasf = (gs_trasf_rec / max(0.1, m_gol_casa)) if gs_trasf_rec is not None else 1.0
+
+    attacco_casa = peso_casa * rapp_attacco_casa + (1 - peso_casa) * 1.0
+    difesa_casa = peso_casa * rapp_difesa_casa + (1 - peso_casa) * 1.0
+    attacco_trasf = peso_trasf * rapp_attacco_trasf + (1 - peso_trasf) * 1.0
+    difesa_trasf = peso_trasf * rapp_difesa_trasf + (1 - peso_trasf) * 1.0
+
+    tiri_casa_finale = peso_casa * tiri_casa + (1 - peso_casa) * m_tiri_casa_lega if tiri_casa is not None else m_tiri_casa_lega
+    corner_casa_finale = peso_casa * corner_casa + (1 - peso_casa) * m_corner_casa_lega if corner_casa is not None else m_corner_casa_lega
+    tiri_trasf_finale = peso_trasf * tiri_trasf + (1 - peso_trasf) * m_tiri_trasf_lega if tiri_trasf is not None else m_tiri_trasf_lega
+    corner_trasf_finale = peso_trasf * corner_trasf + (1 - peso_trasf) * m_corner_trasf_lega if corner_trasf is not None else m_corner_trasf_lega
+
+    lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
+    lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
 
     prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
     prob_goal, prob_nogoal = 0.0, 0.0
     limiti_under = [1.5, 2.5, 3.5]
     prob_under = {l: 0.0 for l in limiti_under}
-    
     multigol_casa = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     multigol_trasf = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    
-    # Motore Combo Avanzato flessibile
-    combo_stats = {}
+    combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
+    griglia_risultati = []  # FIX #5 — griglia completa per il motore combo libero
 
     tot_p = 0.0
     for gc in range(8):
@@ -192,42 +266,26 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, dat
             p = poisson.pmf(gc, lam_c) * poisson.pmf(gt, lam_t) * tau_dixon_coles(gc, gt, lam_c, lam_t, rho) * 100
             tot_p += p
             segno = 'X' if gc == gt else ('1' if gc > gt else '2')
-            
+            griglia_risultati.append({"gc": gc, "gt": gt, "p": p, "segno": segno})
+
             if segno == '1': prob_1 += p
             elif segno == 'X': prob_x += p
             else: prob_2 += p
-            
-            is_goal = (gc > 0 and gt > 0)
-            if is_goal: prob_goal += p
+
+            if gc > 0 and gt > 0: prob_goal += p
             else: prob_nogoal += p
-            
-            tot_gol = gc + gt
+
             for l in limiti_under:
-                if tot_gol < l: prob_under[l] += p
-                
+                if gc + gt < l: prob_under[l] += p
+
             for mg_key, (mi_c, ma_c) in [("0-1", (0,1)), ("0-2", (0,2)), ("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
                 if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
                 if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
 
-            # Generazione dinamica Combo avanzate richieste
-            # 1 + Over 2.5 + Goal
-            if segno == '1' and tot_gol > 2.5 and is_goal:
-                combo_stats["1 + Over 2.5 + Goal"] = combo_stats.get("1 + Over 2.5 + Goal", 0.0) + p
-            # 1 + Under 2.5 + No Goal
-            if segno == '1' and tot_gol < 2.5 and not is_goal:
-                combo_stats["1 + Under 2.5 + No Goal"] = combo_stats.get("1 + Under 2.5 + No Goal", 0.0) + p
-            # 1 + Over 2.5
-            if segno == '1' and tot_gol > 2.5:
-                combo_stats["1 + Over 2.5"] = combo_stats.get("1 + Over 2.5", 0.0) + p
-            # 1 + Goal
-            if segno == '1' and is_goal:
-                combo_stats["1 + Goal"] = combo_stats.get("1 + Goal", 0.0) + p
-            # X + Under 2.5
-            if segno == 'X' and tot_gol < 2.5:
-                combo_stats["X + Under 2.5"] = combo_stats.get("X + Under 2.5", 0.0) + p
-            # 2 + Goal
-            if segno == '2' and is_goal:
-                combo_stats["2 + Goal"] = combo_stats.get("2 + Goal", 0.0) + p
+            if segno == '1' and gc > 0 and gt > 0: combo_stats["1 + Goal"] += p
+            if segno == '1' and (gc + gt) > 2.5: combo_stats["1 + Over 2.5"] += p
+            if segno == 'X' and (gc + gt) < 2.5: combo_stats["X + Under 2.5"] += p
+            if segno == '2' and gc > 0 and gt > 0: combo_stats["2 + Goal"] += p
 
     if tot_p > 0:
         f = 100.0 / tot_p
@@ -237,14 +295,48 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, dat
         multigol_casa = {k: v*f for k, v in multigol_casa.items()}
         multigol_trasf = {k: v*f for k, v in multigol_trasf.items()}
         combo_stats = {k: v*f for k, v in combo_stats.items()}
+        for r in griglia_risultati:
+            r["p"] *= f
 
     return {
         "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
         "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
         "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
-        "combo": combo_stats, "angoli_stimati": f"{corner_casa + corner_trasf:.1f}",
-        "tiri_stimati": f"{tiri_casa + tiri_trasf:.1f}"
+        "combo": combo_stats, "griglia": griglia_risultati,
+        "angoli_stimati": f"{corner_casa_finale + corner_trasf_finale:.1f}",
+        "tiri_stimati": f"{tiri_casa_finale + tiri_trasf_finale:.1f}",
+        "n_casa": n_casa, "n_trasf": n_trasf,
     }
+
+
+# =====================================================================
+# 🔧 FIX #5 — MOTORE COMBO LIBERO
+# Calcola la probabilità congiunta di qualunque combinazione di segno +
+# soglia gol (Over/Under) + Gol/No Gol, leggendo direttamente dalla griglia
+# di risultati già calcolata — corretto per costruzione (somma le celle
+# della griglia Poisson che soddisfano TUTTE le condizioni insieme, non
+# moltiplica probabilità come se fossero eventi indipendenti, cosa che
+# gol/segno NON sono).
+# =====================================================================
+def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None, gol_nogol=None):
+    tot = 0.0
+    for r in griglia:
+        gc, gt, p = r["gc"], r["gt"], r["p"]
+        ok = True
+        if segno and r["segno"] != segno:
+            ok = False
+        if ok and soglia_gol is not None and tipo_soglia:
+            tot_g = gc + gt
+            if tipo_soglia == "Over" and not (tot_g > soglia_gol): ok = False
+            if tipo_soglia == "Under" and not (tot_g < soglia_gol): ok = False
+        if ok and gol_nogol:
+            entrambe_segnano = gc > 0 and gt > 0
+            if gol_nogol == "Goal" and not entrambe_segnano: ok = False
+            if gol_nogol == "NoGoal" and entrambe_segnano: ok = False
+        if ok:
+            tot += p
+    return tot
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
@@ -259,112 +351,187 @@ def carica_fixture_future(id_fd):
             return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
     return pd.DataFrame()
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_api_europee(codice_competizione, api_key):
     headers = {"X-Auth-Token": api_key}
     url_matches = f"https://api.football-data.org/v4/competitions/{codice_competizione}/matches"
     try:
         resp = requests.get(url_matches, headers=headers, timeout=15)
-        if resp.status_code == 403: return "ERRORE_403"
+        if resp.status_code == 403:
+            return "ERRORE_403"
         resp.raise_for_status()
         data = resp.json()
+        matches = data.get("matches", [])
         rows = []
-        for m in data.get("matches", []):
-            home = m['homeTeam']['name']
-            away = m['awayTeam']['name']
-            date_str = m['utcDate'][:10]
+        for m in matches:
             status = m['status']
             fthg, ftag = None, None
             if status == 'FINISHED':
                 fthg = m['score']['fullTime']['home']
                 ftag = m['score']['fullTime']['away']
-            rows.append({'Date': date_str, 'HomeTeam': home, 'AwayTeam': away, 'FTHG': fthg, 'FTAG': ftag, 'Status': status})
+            rows.append({
+                'Date': m['utcDate'][:10], 'HomeTeam': m['homeTeam']['name'], 'AwayTeam': m['awayTeam']['name'],
+                'FTHG': fthg, 'FTAG': ftag, 'Status': status,
+            })
         df = pd.DataFrame(rows)
         df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
         return df.sort_values('Date_parsed').reset_index(drop=True)
     except Exception as e:
         return str(e)
 
-def estrai_quota_sicura(dizionario, chiave, default=0.0):
-    val = dizionario.get(chiave)
-    if pd.isna(val) or val == '' or val is None: return float(default)
-    try: return float(val)
-    except: return float(default)
 
-st.title("⚡ COMBO Betting Pro")
-st.caption("Modello Statistico Avanzato No-Look-Ahead con Motore Combo & Stime Tiri/Angoli")
+# =====================================================================
+# 🔧 FIX #3 — VALUE BET CORRETTO (overround + media multi-bookmaker)
+# Prima: EV = probabilità_modello × quota_grezza di UN SOLO bookmaker
+# (Bet365), senza depurare la quota dal margine del bookmaker — lo stesso
+# bug dell'overround già corretto nell'App Risultati Fissi. Ora: media di
+# tutti i bookmaker disponibili nel file, quota "equa" depurata dal margine.
+# =====================================================================
+def classifica_colonne_quote(colonne):
+    apertura_h = [c for c in colonne if c.endswith('H') and not c.endswith('CH') and c not in ['FTHG', 'HTHG', 'PTHG']]
+    apertura_d = [c for c in colonne if c.endswith('D') and not c.endswith('CD') and c not in ['FTHG', 'FTAG', 'HTHG', 'HTAG']]
+    apertura_a = [c for c in colonne if c.endswith('A') and not c.endswith('CA') and c not in ['FTAG', 'HTAG', 'PTAG']]
+    return apertura_h, apertura_d, apertura_a
+
+
+def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
+    vh = [riga[c] for c in colonne_h if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    vd = [riga[c] for c in colonne_d if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    va = [riga[c] for c in colonne_a if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    if not (vh and vd and va): return None
+    qh, qd, qa = sum(vh)/len(vh), sum(vd)/len(vd), sum(va)/len(va)
+    pih, pid, pia = 1/qh, 1/qd, 1/qa
+    over = pih + pid + pia
+    return {"q_casa_equa": over/pih, "q_x_equa": over/pid, "q_trasf_equa": over/pia,
+            "overround": over, "n_bookmakers": len(vh)}
+
+
+# =====================================================================
+# 🖥️ INTERFACCIA
+# =====================================================================
+st.title("⚽ COMBO — Advanced Betting Model")
+st.caption("Modello statistico con combo libere e analisi value bet — Dixon-Coles + EWMA + shrinkage")
 
 with st.sidebar:
-    st.header("⚙️ Configurazione")
-    api_key_input = st.text_input("Chiave API football-data.org (Coppe)", type="password")
+    st.header("⚙️ Configurazione & API")
+    api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password",
+                                   help="Gratuita: football-data.org/client/register")
     st.divider()
     rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
-    ewma_span_val = st.slider("Finestra Forma (EWMA)", 2, 15, 6, 1)
+    ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
     emivita_val = st.slider("Decadimento Temporale (Giorni)", 30, 365, 180, 10)
 
-scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali", "Coppe Europee"], horizontal=True)
+scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
-if scelta_categoria == "Campionati Nazionali":
+if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     campionato = st.selectbox("Seleziona Campionato", list(CAMPIONATI_DOMESTICI.keys()))
     info = CAMPIONATI_DOMESTICI[campionato]
     id_fd = info["id_fd"]
-    
-    with st.spinner("Caricamento dataset..."):
+
+    with st.spinner("Caricamento dataset campionato e quote automatiche..."):
         dati = carica_dati_campionato(id_fd)
         fixture_future = carica_fixture_future(id_fd)
-        
+
     if dati is None or len(dati) == 0:
-        st.error("Errore di caricamento dati.")
+        st.error("Impossibile scaricare i dati. Riprova tra poco.")
         st.stop()
-        
+
     opzioni_partite, mappa_partite = [], []
     if not fixture_future.empty:
         for _, r in fixture_future.iterrows():
             opzioni_partite.append(f"FUTURA ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
             mappa_partite.append(r.to_dict())
-    for _, r in dati[dati['FTHG'].notna()].tail(15).iterrows():
+
+    storiche = dati[dati['FTHG'].notna()].tail(15)
+    for _, r in storiche.iterrows():
         opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
         mappa_partite.append(r.to_dict())
     df_globale = pd.DataFrame()
     is_coppa = False
+
 else:
     if not api_key_input:
-        st.warning("⚠️ Inserisci la chiave API per le coppe.")
+        st.warning("⚠️ Inserisci la tua chiave API di football-data.org nella barra laterale per sbloccare le coppe europee.")
         st.stop()
     campionato = st.selectbox("Seleziona Coppe", list(CAMPIONATI_COPPE.keys()))
     info = CAMPIONATI_COPPE[campionato]
-    
-    with st.spinner("Connessione API Coppe..."):
-        risultato_api = carica_dati_api_europee(info["code"], api_key_input)
+    code_api = info["code"]
+
+    with st.spinner("Connessione alle API delle Coppe e caricamento dati di supporto..."):
+        risultato_api = carica_dati_api_europee(code_api, api_key_input)
         df_globale = carica_tutti_i_campionati()
-        
-    if isinstance(risultato_api, str):
-        st.error(f"Errore API: {risultato_api}")
+
+    if isinstance(risultato_api, str) and risultato_api == "ERRORE_403":
+        st.error("❌ **Accesso Negato (Errore 403)**: la tua chiave API gratuita non ha accesso a questa competizione.")
         st.stop()
-        
+    elif isinstance(risultato_api, str):
+        st.error(f"Errore di connessione API: {risultato_api}")
+        st.stop()
+
     dati = risultato_api
+    if dati is None or len(dati) == 0:
+        st.error("Nessun dato trovato per questa competizione.")
+        st.stop()
+
+    dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
+    dati_future = dati[dati['Status'] != 'FINISHED'].copy()
+
     opzioni_partite, mappa_partite = [], []
-    for _, r in dati[dati['Status'] != 'FINISHED'].iterrows():
+    for _, r in dati_future.iterrows():
         opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
-    for _, r in dati[dati['Status'] == 'FINISHED'].tail(10).iterrows():
+    for _, r in dati_storico.tail(10).iterrows():
         opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
         mappa_partite.append(r.to_dict())
     is_coppa = True
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile.")
+    st.warning("Nessuna partita disponibile al momento.")
 else:
     scelta = st.selectbox("Seleziona Partita", opzioni_partite)
-    partita_sel = mappa_partite[opzioni_partite.index(scelta)]
-    
-    modello = calcola_modello_completo(dati, partita_sel['HomeTeam'], partita_sel['AwayTeam'], partita_sel.get('Date'), rho_val, ewma_span_val, emivita_val, df_globale)
-    
-    if modello:
-        st.subheader(f"📊 Analisi COMBO: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
-        
+    idx_sel = opzioni_partite.index(scelta)
+    partita_sel = mappa_partite[idx_sel]
+
+    # =====================================================================
+    # 🔧 FIX #2 — FILTRO NO-LOOK-AHEAD
+    # Prima: il modello riceveva TUTTO il dataset, comprese le giornate
+    # successive alla partita selezionata (per le partite "GIOCATA"/
+    # "RECENTE" già nel passato) — calcolava quindi le statistiche anche
+    # con risultati che, a quella data, non erano ancora accaduti.
+    # Ora: filtriamo sempre a "solo partite precedenti alla data selezionata".
+    # =====================================================================
+    data_rif_sel = partita_sel.get('Date_parsed')
+    if pd.notna(data_rif_sel):
+        dati_filtrati = dati[(dati['FTHG'].notna()) & (dati['Date_parsed'] < data_rif_sel)].copy() if 'Date_parsed' in dati.columns else dati
+        df_globale_filtrato = df_globale[(df_globale['FTHG'].notna()) & (df_globale['Date_parsed'] < data_rif_sel)].copy() \
+            if (df_globale is not None and not df_globale.empty and 'Date_parsed' in df_globale.columns) else df_globale
+    else:
+        dati_filtrati = dati[dati['FTHG'].notna()].copy() if 'FTHG' in dati.columns else dati
+        df_globale_filtrato = df_globale
+
+    modello = calcola_modello_completo(dati_filtrati, partita_sel['HomeTeam'], partita_sel['AwayTeam'],
+                                        rho_val, ewma_span_val, emivita_val, df_globale_filtrato,
+                                        data_riferimento=data_rif_sel if pd.notna(data_rif_sel) else None)
+
+    if modello is None:
+        st.warning(f"⚠️ Impossibile elaborare il match per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}**.")
+    else:
+        st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
+
+        # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
+        SOGLIA_AVVISO = 5
+        avvisi = []
+        if modello["n_casa"] < SOGLIA_AVVISO:
+            avvisi.append(f"{partita_sel['HomeTeam']} (solo {modello['n_casa']} partite trovate)")
+        if modello["n_trasf"] < SOGLIA_AVVISO:
+            avvisi.append(f"{partita_sel['AwayTeam']} (solo {modello['n_trasf']} partite trovate)")
+        if avvisi:
+            st.warning("⚠️ Stima poco affidabile per: " + " e ".join(avvisi) +
+                       " — il modello converge verso la media di lega/competizione per compensare "
+                       "la scarsità di dati specifici, ma la previsione resta meno precisa del solito.")
+
         def crea_tabella(dati_dict, col_nome="Mercato"):
-            if not dati_dict: return pd.DataFrame(columns=[col_nome, "Probabilità (%)"])
             df = pd.DataFrame(list(dati_dict.items()), columns=[col_nome, "Probabilità (%)"])
             df["Probabilità (%)"] = df["Probabilità (%)"].round(1)
             df = df.sort_values(by="Probabilità (%)", ascending=False).reset_index(drop=True)
@@ -372,53 +539,109 @@ else:
             return df
 
         st.markdown("### 🏆 Esito Finale (1X2)")
-        st.dataframe(crea_tabella({"1 (Casa)": modello['prob_1'], "X (Pareggio)": modello['prob_X'], "2 (Trasferta)": modello['prob_2']}, "Segno"), use_container_width=True, hide_index=True)
+        df_1x2 = crea_tabella({"1 (Casa)": modello['prob_1'], "X (Pareggio)": modello['prob_X'], "2 (Trasferta)": modello['prob_2']}, "Segno")
+        st.dataframe(df_1x2, use_container_width=True, hide_index=True)
 
-        # Controllo Value Bet con normalizzazione Overround
         if not is_coppa:
-            st.markdown("### 💰 Controllo Value Bet (Normalizzato)")
-            q_1, q_x, q_2 = estrai_quota_sicura(partita_sel, 'B365H'), estrai_quota_sicura(partita_sel, 'B365D'), estrai_quota_sicura(partita_sel, 'B365A')
-            if q_1 > 0 and q_x > 0 and q_2 > 0:
-                implied_sum = (1/q_1) + (1/q_x) + (1/q_2) # Overround
-                ev_1 = (modello['prob_1'] / 100.0) * (q_1 * implied_sum)
-                ev_x = (modello['prob_X'] / 100.0) * (q_x * implied_sum)
-                ev_2 = (modello['prob_2'] / 100.0) * (q_2 * implied_sum)
+            st.markdown("### 💰 Controllo Value Bet (media multi-bookmaker, quote depurate dal margine)")
+            colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati.columns)
+            quote = quote_mercato_normalizzate(partita_sel, colonne_h, colonne_d, colonne_a)
+            if quote:
+                ev_1 = (modello['prob_1'] / 100.0) * quote['q_casa_equa']
+                ev_x = (modello['prob_X'] / 100.0) * quote['q_x_equa']
+                ev_2 = (modello['prob_2'] / 100.0) * quote['q_trasf_equa']
                 dati_ev = [
-                    {"Segno": "1", "Quota": q_1, "Valutazione": "🔥 OTTIMO VALORE" if ev_1 > 1.05 else "Nessun Valore"},
-                    {"Segno": "X", "Quota": q_x, "Valutazione": "🔥 OTTIMO VALORE" if ev_x > 1.05 else "Nessun Valore"},
-                    {"Segno": "2", "Quota": q_2, "Valutazione": "🔥 OTTIMO VALORE" if ev_2 > 1.05 else "Nessun Valore"}
+                    {"Segno": "1 (Casa)", "Quota Equa": f"{quote['q_casa_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
+                    {"Segno": "X (Pareggio)", "Quota Equa": f"{quote['q_x_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
+                    {"Segno": "2 (Trasferta)", "Quota Equa": f"{quote['q_trasf_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_2 > 1.05 else ("📈 Leggero Valore" if ev_2 > 1.0 else "Nessun Valore")},
                 ]
+                st.caption(f"Media su {quote['n_bookmakers']} bookmaker, margine rimosso: {(quote['overround']-1)*100:.1f}%")
                 st.dataframe(pd.DataFrame(dati_ev), use_container_width=True, hide_index=True)
             else:
-                st.info("Quote non disponibili.")
+                st.info("ℹ️ Quote dei bookmaker non disponibili per questa specifica partita.")
         else:
-            st.markdown("### 🎯 Quote Eque Statistiche (Coppe)")
-            df_fair = pd.DataFrame([
-                {"Segno": "1", "Prob": f"{modello['prob_1']:.1f}%", "Quota Equa Minima": f"{100/modello['prob_1']:.2f}" if modello['prob_1']>0 else "N/A"},
-                {"Segno": "X", "Prob": f"{modello['prob_X']:.1f}%", "Quota Equa Minima": f"{100/modello['prob_X']:.2f}" if modello['prob_X']>0 else "N/A"},
-                {"Segno": "2", "Prob": f"{modello['prob_2']:.1f}%", "Quota Equa Minima": f"{100/modello['prob_2']:.2f}" if modello['prob_2']>0 else "N/A"}
-            ])
-            st.dataframe(df_fair, use_container_width=True, hide_index=True)
+            st.markdown("### 🎯 Quota Equa Statistica (Coppe Europee)")
+            st.caption("Nessuna quota di mercato disponibile per le coppe: il modello mostra la quota equa "
+                       "basata sulla probabilità pura. Cerca sui bookmaker quote superiori a questi valori.")
+            q_fair_1 = 100.0 / modello['prob_1'] if modello['prob_1'] > 0 else 0.0
+            q_fair_x = 100.0 / modello['prob_X'] if modello['prob_X'] > 0 else 0.0
+            q_fair_2 = 100.0 / modello['prob_2'] if modello['prob_2'] > 0 else 0.0
+            dati_fair = [
+                {"Segno": "1 (Casa)", "Probabilità": f"{modello['prob_1']:.1f}%", "Quota Equa Minima": f"{q_fair_1:.2f}"},
+                {"Segno": "X (Pareggio)", "Probabilità": f"{modello['prob_X']:.1f}%", "Quota Equa Minima": f"{q_fair_x:.2f}"},
+                {"Segno": "2 (Trasferta)", "Probabilità": f"{modello['prob_2']:.1f}%", "Quota Equa Minima": f"{q_fair_2:.2f}"},
+            ]
+            st.dataframe(pd.DataFrame(dati_fair), use_container_width=True, hide_index=True)
 
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("### ⚽ Goal / No Goal")
-            st.dataframe(crea_tabella({"Goal": modello['prob_goal'], "No Goal": modello['prob_nogoal']}, "Opzione"), use_container_width=True, hide_index=True)
+            st.dataframe(crea_tabella({"Goal": modello['prob_goal'], "No Goal": modello['prob_nogoal']}, "Opzione"),
+                        use_container_width=True, hide_index=True)
         with col_b:
             st.markdown("### 📉 Under / Over")
-            oo_dict = {f"Under {s}": p for s, p in modello['prob_under'].items()}
-            oo_dict.update({f"Over {s}": 100 - p for s, p in modello['prob_under'].items()})
+            oo_dict = {}
+            for soglia, prob_u in modello['prob_under'].items():
+                oo_dict[f"Under {soglia}"] = prob_u
+                oo_dict[f"Over {soglia}"] = 100 - prob_u
             st.dataframe(crea_tabella(oo_dict, "Linea"), use_container_width=True, hide_index=True)
 
-        st.markdown("### ⚡ COMBO Avanzate Consigliate")
+        col_c, col_d = st.columns(2)
+        with col_c:
+            st.markdown("### 🏠 Multigol Casa")
+            st.dataframe(crea_tabella(modello['multigol_casa'], "Intervallo"), use_container_width=True, hide_index=True)
+        with col_d:
+            st.markdown("### ✈️ Multigol Ospite")
+            st.dataframe(crea_tabella(modello['multigol_trasf'], "Intervallo"), use_container_width=True, hide_index=True)
+
+        st.markdown("### 🔥 Combo Rapide")
         st.dataframe(crea_tabella(modello['combo'], "Combinazione"), use_container_width=True, hide_index=True)
 
-        st.markdown("### 🎯 Statistiche Match (Tiri & Angoli)")
-        st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | 🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**")
+        # =====================================================================
+        # 🎯 FIX #5 — COSTRUISCI LA TUA COMBO (motore libero)
+        # =====================================================================
+        st.divider()
+        st.markdown("### 🎯 Costruisci la tua combo")
+        st.caption("Combina segno + soglia gol + gol/no gol come vuoi (es. '1 + Over 2.5 + Goal', "
+                   "'X + Under 1.5 + NoGoal'). La probabilità è calcolata correttamente sulla griglia "
+                   "Poisson congiunta, non moltiplicando probabilità come se fossero indipendenti.")
 
-        st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
-        df_h2h = estrai_scontri_diretti(partita_sel['HomeTeam'], partita_sel['AwayTeam'], dati, df_globale, pd.to_datetime(partita_sel.get('Date')))
-        if not df_h2h.empty:
-            st.dataframe(df_h2h[['Date', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam']], use_container_width=True, hide_index=True)
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            segno_combo = st.selectbox("Segno", ["Nessun filtro", "1", "X", "2"])
+        with cc2:
+            soglia_combo = st.selectbox("Soglia gol", ["Nessun filtro", "0.5", "1.5", "2.5", "3.5", "4.5"])
+            tipo_soglia_combo = st.radio("Tipo", ["Over", "Under"], horizontal=True, disabled=(soglia_combo == "Nessun filtro"))
+        with cc3:
+            gg_combo = st.selectbox("Gol/No Gol", ["Nessun filtro", "Goal", "NoGoal"])
+
+        segno_p = None if segno_combo == "Nessun filtro" else segno_combo
+        soglia_p = None if soglia_combo == "Nessun filtro" else float(soglia_combo)
+        tipo_p = tipo_soglia_combo if soglia_p is not None else None
+        gg_p = None if gg_combo == "Nessun filtro" else gg_combo
+
+        if segno_p is None and soglia_p is None and gg_p is None:
+            st.info("Seleziona almeno un filtro per calcolare la combo.")
         else:
-            st.info("Nessun precedente trovato prima di questa data.")
+            prob_combo = calcola_combo_libera(modello['griglia'], segno=segno_p, soglia_gol=soglia_p,
+                                              tipo_soglia=tipo_p, gol_nogol=gg_p)
+            quota_equa_combo = 100.0 / prob_combo if prob_combo > 0 else 0.0
+            pezzi = [p for p in [segno_p, f"{tipo_p} {soglia_p}" if soglia_p else None, gg_p] if p]
+            st.success(f"**{' + '.join(pezzi)}** → Probabilità: **{prob_combo:.1f}%** — Quota equa minima: **{quota_equa_combo:.2f}**")
+
+        st.divider()
+        st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
+        df_h2h = estrai_scontri_diretti(partita_sel['HomeTeam'], partita_sel['AwayTeam'], dati_filtrati, df_globale_filtrato)
+        if not df_h2h.empty:
+            cols_mostra = [c for c in ['Date', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam'] if c in df_h2h.columns]
+            st.dataframe(df_h2h[cols_mostra], use_container_width=True, hide_index=True)
+        else:
+            st.info("Nessun precedente recente trovato negli archivi disponibili tra queste due squadre.")
+
+        st.divider()
+        st.markdown("### 🎯 Statistiche Match (Stimate)")
+        nota_stima = ""
+        if avvisi:
+            nota_stima = " ⚠️ (basate parzialmente sulla media di lega per scarsità di dati specifici)"
+        st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | "
+                f"🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**{nota_stima}")
