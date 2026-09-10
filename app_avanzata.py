@@ -55,28 +55,21 @@ def codici_stagione(oggi=None):
     return fmt(anno_inizio), fmt(anno_inizio - 1)
 
 def tau_dixon_coles(gc, gt, lc, lt, rho):
-    if gc == 0 and gt == 0:
-        return 1 - (lc * lt * rho)
-    elif gc == 0 and gt == 1:
-        return 1 + (lc * rho)
-    elif gc == 1 and gt == 0:
-        return 1 + (lt * rho)
-    elif gc == 1 and gt == 1:
-        return 1 - rho
+    if gc == 0 and gt == 0: return 1 - (lc * lt * rho)
+    if gc == 0 and gt == 1: return 1 + (lc * rho)
+    if gc == 1 and gt == 0: return 1 + (lt * rho)
+    if gc == 1 and gt == 1: return 1 - rho
     return 1.0
 
 def media_ewma(serie, span):
     serie = serie.dropna()
-    if len(serie) == 0:
-        return None
+    if len(serie) == 0: return None
     return serie.ewm(span=span, min_periods=1).mean().iloc[-1]
 
 def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
-    if colonna not in df.columns:
-        return None
+    if colonna not in df.columns: return None
     sub = df[[colonna, 'Date_parsed']].dropna()
-    if len(sub) == 0:
-        return None
+    if len(sub) == 0: return None
     giorni = (data_riferimento - sub['Date_parsed']).dt.days.clip(lower=0)
     pesi = 0.5 ** (giorni / emivita)
     tot = pesi.sum()
@@ -112,8 +105,7 @@ def carica_dati_campionato(id_fd):
         if df is not None:
             df.columns = df.columns.str.strip()
             frames.append(df)
-    if not frames:
-        return None
+    if not frames: return None
     dati = pd.concat(frames, ignore_index=True, sort=False)
     dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
     return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
@@ -123,19 +115,16 @@ def carica_tutti_i_campionati():
     tutti = []
     for info in CAMPIONATI_DOMESTICI.values():
         df = carica_dati_campionato(info["id_fd"])
-        if df is not None:
-            tutti.append(df)
+        if df is not None: tutti.append(df)
     return pd.concat(tutti, ignore_index=True) if tutti else pd.DataFrame()
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
     df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
-    if df is None:
-        return pd.DataFrame()
+    if df is None: return pd.DataFrame()
     fx = df.copy()
     fx.columns = fx.columns.str.strip()
-    if 'Div' not in fx.columns:
-        return pd.DataFrame()
+    if 'Div' not in fx.columns: return pd.DataFrame()
     fx = fx[fx['Div'] == id_fd].copy()
     fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
     oggi = pd.Timestamp(date.today())
@@ -147,8 +136,7 @@ def carica_dati_api_europee(codice, api_key):
     url = f"https://api.football-data.org/v4/competitions/{codice}/matches"
     try:
         resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 403:
-            return "ERRORE_403"
+        if resp.status_code == 403: return "ERRORE_403"
         resp.raise_for_status()
         matches = resp.json().get("matches", [])
         rows = []
@@ -162,9 +150,7 @@ def carica_dati_api_europee(codice, api_key):
                 'Date': m['utcDate'][:10],
                 'HomeTeam': m['homeTeam']['name'],
                 'AwayTeam': m['awayTeam']['name'],
-                'FTHG': fthg,
-                'FTAG': ftag,
-                'Status': status,
+                'FTHG': fthg, 'FTAG': ftag, 'Status': status,
             })
         df = pd.DataFrame(rows)
         df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
@@ -172,33 +158,23 @@ def carica_dati_api_europee(codice, api_key):
     except Exception as e:
         return str(e)
 
-# ====================== ESTRAZIONE DATI ======================
+# ====================== ESTRAZIONE ======================
 def estrai_partite_squadra(squadra, df_coppa, df_globale):
-    if df_coppa is not None and not df_coppa.empty:
-        mask = df_coppa['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
-               df_coppa['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
-        f = df_coppa[mask]
-        if len(f) > 0:
-            return f
-    if df_globale is not None and not df_globale.empty:
-        mask = df_globale['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
-               df_globale['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
-        f = df_globale[mask]
-        if len(f) > 0:
-            return f
+    for df in [df_coppa, df_globale]:
+        if df is None or df.empty: continue
+        mask = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
+               df['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+        f = df[mask]
+        if len(f) > 0: return f
     return pd.DataFrame()
 
 def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
     frames = []
-    if df_coppa is not None and not df_coppa.empty:
-        frames.append(df_coppa)
-    if df_globale is not None and not df_globale.empty:
-        frames.append(df_globale)
-    if not frames:
-        return pd.DataFrame()
+    if df_coppa is not None and not df_coppa.empty: frames.append(df_coppa)
+    if df_globale is not None and not df_globale.empty: frames.append(df_globale)
+    if not frames: return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
-    if 'FTHG' not in df.columns:
-        return pd.DataFrame()
+    if 'FTHG' not in df.columns: return pd.DataFrame()
     mask_dir = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa)) & \
                df['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta))
     mask_inv = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta)) & \
@@ -246,7 +222,19 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
     under = {1.5: 0.0, 2.5: 0.0, 3.5: 0.0}
     multi_c = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
     multi_t = multi_c.copy()
-    combo = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
+
+    # Combo classiche
+    combo_classiche = {
+        "1 + Goal": 0.0, "1 + No Goal": 0.0,
+        "X + Goal": 0.0, "X + No Goal": 0.0,
+        "2 + Goal": 0.0, "2 + No Goal": 0.0,
+        "1 + Over 2.5": 0.0, "1 + Under 2.5": 0.0,
+        "X + Over 2.5": 0.0, "X + Under 2.5": 0.0,
+        "2 + Over 2.5": 0.0, "2 + Under 2.5": 0.0,
+    }
+
+    # Super Combo (3 fattori)
+    super_combo = {}
 
     tot = 0.0
     for gc in range(8):
@@ -254,40 +242,56 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
             p = poisson.pmf(gc, lam_c) * poisson.pmf(gt, lam_t) * tau_dixon_coles(gc, gt, lam_c, lam_t, rho) * 100
             tot += p
             segno = "X" if gc == gt else ("1" if gc > gt else "2")
+            entrambe_segnano = gc > 0 and gt > 0
+            tot_gol = gc + gt
+
             griglia.append({"gc": gc, "gt": gt, "p": p, "segno": segno})
 
             if segno == "1": p1 += p
             elif segno == "X": px += p
             else: p2 += p
 
-            if gc > 0 and gt > 0:
-                p_goal += p
-            else:
-                p_nogoal += p
+            if entrambe_segnano: p_goal += p
+            else: p_nogoal += p
 
             for lim in under:
-                if gc + gt < lim:
-                    under[lim] += p
+                if tot_gol < lim: under[lim] += p
 
             for key, (lo, hi) in [("0-1",(0,1)), ("0-2",(0,2)), ("1-2",(1,2)), ("1-3",(1,3)), ("2-3",(2,3)), ("2-4",(2,4))]:
                 if lo <= gc <= hi: multi_c[key] += p
                 if lo <= gt <= hi: multi_t[key] += p
 
-            if segno == "1" and gc > 0 and gt > 0: combo["1 + Goal"] += p
-            if segno == "1" and (gc + gt) > 2.5: combo["1 + Over 2.5"] += p
-            if segno == "X" and (gc + gt) < 2.5: combo["X + Under 2.5"] += p
-            if segno == "2" and gc > 0 and gt > 0: combo["2 + Goal"] += p
+            # Combo classiche
+            if segno == "1" and entrambe_segnano: combo_classiche["1 + Goal"] += p
+            if segno == "1" and not entrambe_segnano: combo_classiche["1 + No Goal"] += p
+            if segno == "X" and entrambe_segnano: combo_classiche["X + Goal"] += p
+            if segno == "X" and not entrambe_segnano: combo_classiche["X + No Goal"] += p
+            if segno == "2" and entrambe_segnano: combo_classiche["2 + Goal"] += p
+            if segno == "2" and not entrambe_segnano: combo_classiche["2 + No Goal"] += p
+
+            if segno == "1" and tot_gol > 2.5: combo_classiche["1 + Over 2.5"] += p
+            if segno == "1" and tot_gol < 2.5: combo_classiche["1 + Under 2.5"] += p
+            if segno == "X" and tot_gol > 2.5: combo_classiche["X + Over 2.5"] += p
+            if segno == "X" and tot_gol < 2.5: combo_classiche["X + Under 2.5"] += p
+            if segno == "2" and tot_gol > 2.5: combo_classiche["2 + Over 2.5"] += p
+            if segno == "2" and tot_gol < 2.5: combo_classiche["2 + Under 2.5"] += p
+
+            # Super Combo (Segno + Goal/NoGoal + Over/Under 2.5)
+            gg = "Goal" if entrambe_segnano else "No Goal"
+            ou = "Over 2.5" if tot_gol > 2.5 else "Under 2.5"
+            chiave = f"{segno} + {gg} + {ou}"
+            super_combo[chiave] = super_combo.get(chiave, 0.0) + p
 
     if tot > 0:
         f = 100.0 / tot
-        p1, px, p2 = p1 * f, px * f, p2 * f
-        p_goal, p_nogoal = p_goal * f, p_nogoal * f
-        under = {k: v * f for k, v in under.items()}
-        multi_c = {k: v * f for k, v in multi_c.items()}
-        multi_t = {k: v * f for k, v in multi_t.items()}
-        combo = {k: v * f for k, v in combo.items()}
-        for r in griglia:
-            r["p"] *= f
+        p1, px, p2 = p1*f, px*f, p2*f
+        p_goal, p_nogoal = p_goal*f, p_nogoal*f
+        under = {k: v*f for k, v in under.items()}
+        multi_c = {k: v*f for k, v in multi_c.items()}
+        multi_t = {k: v*f for k, v in multi_t.items()}
+        combo_classiche = {k: v*f for k, v in combo_classiche.items()}
+        super_combo = {k: v*f for k, v in super_combo.items()}
+        for r in griglia: r["p"] *= f
 
     return {
         "prob_1": p1, "prob_X": px, "prob_2": p2,
@@ -295,10 +299,9 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
         "prob_under": under,
         "multigol_casa": multi_c,
         "multigol_trasf": multi_t,
-        "combo": combo,
-        "griglia": griglia,
-        "n_casa": n_casa,
-        "n_trasf": n_trasf,
+        "combo_classiche": combo_classiche,
+        "super_combo": super_combo,
+        "n_casa": n_casa, "n_trasf": n_trasf,
     }
 
 def crea_tabella(dati_dict, nome_col="Mercato"):
@@ -310,71 +313,64 @@ def crea_tabella(dati_dict, nome_col="Mercato"):
 
 # ====================== INTERFACCIA ======================
 st.title("⚽ COMBO — Advanced Betting Model")
-st.caption("Modello Dixon-Coles + EWMA + Shrinkage • Solo fonti gratuite")
+st.caption("Dixon-Coles + EWMA + Shrinkage • Solo fonti gratuite")
 
 with st.sidebar:
     st.header("⚙️ Configurazione")
-    api_key = st.text_input("Chiave API football-data.org (per le Coppe)", type="password",
-                            help="Gratuita su football-data.org")
+    api_key = st.text_input("Chiave API football-data.org (per le Coppe)", type="password")
     st.divider()
-    rho = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
-    ewma_span = st.slider("Finestra Forma Recente", 3, 12, 6)
-    emivita = st.slider("Decadimento Temporale (giorni)", 60, 300, 150)
+    rho = st.slider("Dixon-Coles ρ", -0.20, 0.10, -0.10, 0.01)
+    ewma_span = st.slider("Finestra Forma", 3, 12, 6)
+    emivita = st.slider("Decadimento (giorni)", 60, 300, 150)
 
-categoria = st.radio("Seleziona categoria", ["Campionati Nazionali", "Coppe Europee"], horizontal=True)
+categoria = st.radio("Categoria", ["Campionati Nazionali", "Coppe Europee"], horizontal=True)
 
 if categoria == "Campionati Nazionali":
     campionato = st.selectbox("Campionato", list(CAMPIONATI_DOMESTICI.keys()))
     id_fd = CAMPIONATI_DOMESTICI[campionato]["id_fd"]
-    with st.spinner("Caricamento dati..."):
+    with st.spinner("Caricamento..."):
         dati = carica_dati_campionato(id_fd)
         future = carica_fixture_future(id_fd)
     df_globale = pd.DataFrame()
-    is_coppa = False
 else:
     if not api_key:
-        st.warning("Inserisci la chiave API gratuita nella barra laterale per le Coppe Europee.")
+        st.warning("Inserisci la chiave API gratuita per le Coppe.")
         st.stop()
     campionato = st.selectbox("Coppa", list(CAMPIONATI_COPPE.keys()))
     code = CAMPIONATI_COPPE[campionato]["code"]
-    with st.spinner("Caricamento dati Coppe..."):
+    with st.spinner("Caricamento Coppe..."):
         risultato = carica_dati_api_europee(code, api_key)
         df_globale = carica_tutti_i_campionati()
     if risultato == "ERRORE_403":
-        st.error("Questa competizione non è disponibile nel piano gratuito.")
+        st.error("Competizione non disponibile nel piano gratuito.")
         st.stop()
     if isinstance(risultato, str):
         st.error(f"Errore: {risultato}")
         st.stop()
     dati = risultato
     future = dati[dati["Status"] != "FINISHED"] if "Status" in dati.columns else pd.DataFrame()
-    is_coppa = True
 
 if dati is None or len(dati) == 0:
-    st.error("Impossibile caricare i dati.")
+    st.error("Nessun dato disponibile.")
     st.stop()
 
-# Lista partite
-opzioni = []
-mappa = []
+opzioni, mappa = [], []
 if not future.empty:
     for _, r in future.iterrows():
-        opzioni.append(f"FUTURA ({r.get('Date', '?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
+        opzioni.append(f"FUTURA ({r.get('Date','?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
         mappa.append(r.to_dict())
-
 storiche = dati[dati["FTHG"].notna()].tail(12) if "FTHG" in dati.columns else pd.DataFrame()
 for _, r in storiche.iterrows():
-    opzioni.append(f"RECENTE ({r.get('Date', '?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
+    opzioni.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
     mappa.append(r.to_dict())
 
 if not opzioni:
-    st.warning("Nessuna partita disponibile.")
+    st.warning("Nessuna partita trovata.")
     st.stop()
 
-scelta = st.selectbox("Seleziona la partita", opzioni)
+scelta = st.selectbox("Seleziona partita", opzioni)
 partita = mappa[opzioni.index(scelta)]
 
-# Filtro no-look-ahead
 data_rif = partita.get("Date_parsed")
 if pd.notna(data_rif):
     dati_f = dati[(dati["FTHG"].notna()) & (dati["Date_parsed"] < data_rif)].copy() if "Date_parsed" in dati.columns else dati
@@ -383,22 +379,16 @@ else:
     dati_f = dati[dati["FTHG"].notna()].copy() if "FTHG" in dati.columns else dati
     glob_f = df_globale
 
-modello = calcola_modello_completo(
-    dati_f, partita["HomeTeam"], partita["AwayTeam"],
-    rho, ewma_span, emivita, glob_f, data_rif
-)
+modello = calcola_modello_completo(dati_f, partita["HomeTeam"], partita["AwayTeam"], rho, ewma_span, emivita, glob_f, data_rif)
 
 # ====================== VISUALIZZAZIONE ======================
 st.markdown(f"## {partita['HomeTeam']}  vs  {partita['AwayTeam']}")
 
-# Avviso qualità dati
 avvisi = []
-if modello["n_casa"] < 6:
-    avvisi.append(f"{partita['HomeTeam']} ({modello['n_casa']} partite)")
-if modello["n_trasf"] < 6:
-    avvisi.append(f"{partita['AwayTeam']} ({modello['n_trasf']} partite)")
+if modello["n_casa"] < 6: avvisi.append(f"{partita['HomeTeam']} ({modello['n_casa']} partite)")
+if modello["n_trasf"] < 6: avvisi.append(f"{partita['AwayTeam']} ({modello['n_trasf']} partite)")
 if avvisi:
-    st.warning("Dati limitati per: " + " • ".join(avvisi) + " → il modello usa più la media di lega.")
+    st.warning("Dati limitati per: " + " • ".join(avvisi))
 
 # 1X2
 st.markdown("### Esito Finale (1X2)")
@@ -407,16 +397,13 @@ c1.metric("1 - Casa", f"{modello['prob_1']:.1f}%")
 c2.metric("X - Pareggio", f"{modello['prob_X']:.1f}%")
 c3.metric("2 - Trasferta", f"{modello['prob_2']:.1f}%")
 
-# Goal / No Goal + Under/Over
-col_a, col_b = st.columns(2)
-with col_a:
+# Goal + Under/Over
+col1, col2 = st.columns(2)
+with col1:
     st.markdown("### Goal / No Goal")
-    st.dataframe(crea_tabella({
-        "Goal": modello["prob_goal"],
-        "No Goal": modello["prob_nogoal"]
-    }, "Mercato"), use_container_width=True, hide_index=True)
-
-with col_b:
+    st.dataframe(crea_tabella({"Goal": modello["prob_goal"], "No Goal": modello["prob_nogoal"]}, "Mercato"),
+                 use_container_width=True, hide_index=True)
+with col2:
     st.markdown("### Under / Over")
     oo = {}
     for lim, pu in modello["prob_under"].items():
@@ -425,37 +412,22 @@ with col_b:
     st.dataframe(crea_tabella(oo, "Linea"), use_container_width=True, hide_index=True)
 
 # Multigol
-col_c, col_d = st.columns(2)
-with col_c:
+col3, col4 = st.columns(2)
+with col3:
     st.markdown("### Multigol Casa")
     st.dataframe(crea_tabella(modello["multigol_casa"], "Intervallo"), use_container_width=True, hide_index=True)
-with col_d:
+with col4:
     st.markdown("### Multigol Ospite")
     st.dataframe(crea_tabella(modello["multigol_trasf"], "Intervallo"), use_container_width=True, hide_index=True)
 
-# ========== TOP 5 COMBO ==========
-st.markdown("### Top 5 Combo")
+# ========== COMBO CLASSICHE ==========
+st.markdown("### Combo Classiche")
+st.dataframe(crea_tabella(modello["combo_classiche"], "Combo"), use_container_width=True, hide_index=True)
 
-combo_estese = {
-    "1 + Goal": modello["combo"]["1 + Goal"],
-    "1 + Over 2.5": modello["combo"]["1 + Over 2.5"],
-    "X + Under 2.5": modello["combo"]["X + Under 2.5"],
-    "2 + Goal": modello["combo"]["2 + Goal"],
-    "Goal": modello["prob_goal"],
-    "Over 2.5": 100 - modello["prob_under"][2.5],
-    "Under 2.5": modello["prob_under"][2.5],
-    "1": modello["prob_1"],
-    "X": modello["prob_X"],
-    "2": modello["prob_2"],
-}
-
-top5 = dict(sorted(combo_estese.items(), key=lambda x: x[1], reverse=True)[:5])
-
-st.dataframe(
-    crea_tabella(top5, "Combo"),
-    use_container_width=True,
-    hide_index=True
-)
+# ========== TOP 5 SUPER COMBO ==========
+st.markdown("### Top 5 Super Combo")
+top5_super = dict(sorted(modello["super_combo"].items(), key=lambda x: x[1], reverse=True)[:5])
+st.dataframe(crea_tabella(top5_super, "Super Combo"), use_container_width=True, hide_index=True)
 
 # Scontri diretti
 st.markdown("### Ultimi Scontri Diretti")
@@ -467,4 +439,4 @@ else:
     st.info("Nessun precedente recente trovato.")
 
 st.divider()
-st.caption("Modello statistico a scopo informativo. Non costituisce consiglio di scommessa. Gioca responsabilmente.")
+st.caption("Modello statistico a scopo informativo. Non costituisce consiglio di scommessa.")
