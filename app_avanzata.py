@@ -172,7 +172,7 @@ def carica_dati_api_europee(codice, api_key):
     except Exception as e:
         return str(e)
 
-# ====================== ESTRAZIONE DATI SQUADRE ======================
+# ====================== ESTRAZIONE DATI ======================
 def estrai_partite_squadra(squadra, df_coppa, df_globale):
     if df_coppa is not None and not df_coppa.empty:
         mask = df_coppa['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
@@ -241,7 +241,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
     lam_c = max(0.25, att_casa * dif_trasf * m_gol_casa)
     lam_t = max(0.25, att_trasf * dif_casa * m_gol_trasf)
 
-    # Calcolo probabilità
     griglia = []
     p1 = px = p2 = p_goal = p_nogoal = 0.0
     under = {1.5: 0.0, 2.5: 0.0, 3.5: 0.0}
@@ -302,28 +301,6 @@ def calcola_modello_completo(giocate, squadra_casa, squadra_trasferta, rho, ewma
         "n_trasf": n_trasf,
     }
 
-def calcola_combo_libera(griglia, segno=None, soglia=None, tipo=None, gol_nogol=None):
-    tot = 0.0
-    for r in griglia:
-        ok = True
-        if segno and r["segno"] != segno:
-            ok = False
-        if ok and soglia is not None and tipo:
-            tot_g = r["gc"] + r["gt"]
-            if tipo == "Over" and not (tot_g > soglia):
-                ok = False
-            if tipo == "Under" and not (tot_g < soglia):
-                ok = False
-        if ok and gol_nogol:
-            entrambe = r["gc"] > 0 and r["gt"] > 0
-            if gol_nogol == "Goal" and not entrambe:
-                ok = False
-            if gol_nogol == "NoGoal" and entrambe:
-                ok = False
-        if ok:
-            tot += r["p"]
-    return tot
-
 def crea_tabella(dati_dict, nome_col="Mercato"):
     df = pd.DataFrame(list(dati_dict.items()), columns=[nome_col, "Probabilità (%)"])
     df["Probabilità (%)"] = df["Probabilità (%)"].round(1)
@@ -333,12 +310,12 @@ def crea_tabella(dati_dict, nome_col="Mercato"):
 
 # ====================== INTERFACCIA ======================
 st.title("⚽ COMBO — Advanced Betting Model")
-st.caption("Modello Dixon-Coles + EWMA + Shrinkage • Solo fonti gratuite • Nessun risultato fisso")
+st.caption("Modello Dixon-Coles + EWMA + Shrinkage • Solo fonti gratuite")
 
 with st.sidebar:
     st.header("⚙️ Configurazione")
     api_key = st.text_input("Chiave API football-data.org (per le Coppe)", type="password",
-                            help="Gratuita: registrati su football-data.org")
+                            help="Gratuita su football-data.org")
     st.divider()
     rho = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
     ewma_span = st.slider("Finestra Forma Recente", 3, 12, 6)
@@ -349,14 +326,14 @@ categoria = st.radio("Seleziona categoria", ["Campionati Nazionali", "Coppe Euro
 if categoria == "Campionati Nazionali":
     campionato = st.selectbox("Campionato", list(CAMPIONATI_DOMESTICI.keys()))
     id_fd = CAMPIONATI_DOMESTICI[campionato]["id_fd"]
-    with st.spinner("Caricamento dati campionato..."):
+    with st.spinner("Caricamento dati..."):
         dati = carica_dati_campionato(id_fd)
         future = carica_fixture_future(id_fd)
     df_globale = pd.DataFrame()
     is_coppa = False
 else:
     if not api_key:
-        st.warning("Per le Coppe Europee inserisci la chiave API gratuita nella barra laterale.")
+        st.warning("Inserisci la chiave API gratuita nella barra laterale per le Coppe Europee.")
         st.stop()
     campionato = st.selectbox("Coppa", list(CAMPIONATI_COPPE.keys()))
     code = CAMPIONATI_COPPE[campionato]["code"]
@@ -364,10 +341,10 @@ else:
         risultato = carica_dati_api_europee(code, api_key)
         df_globale = carica_tutti_i_campionati()
     if risultato == "ERRORE_403":
-        st.error("Questa competizione non è disponibile nel piano gratuito dell'API.")
+        st.error("Questa competizione non è disponibile nel piano gratuito.")
         st.stop()
     if isinstance(risultato, str):
-        st.error(f"Errore di connessione: {risultato}")
+        st.error(f"Errore: {risultato}")
         st.stop()
     dati = risultato
     future = dati[dati["Status"] != "FINISHED"] if "Status" in dati.columns else pd.DataFrame()
@@ -384,6 +361,7 @@ if not future.empty:
     for _, r in future.iterrows():
         opzioni.append(f"FUTURA ({r.get('Date', '?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
         mappa.append(r.to_dict())
+
 storiche = dati[dati["FTHG"].notna()].tail(12) if "FTHG" in dati.columns else pd.DataFrame()
 for _, r in storiche.iterrows():
     opzioni.append(f"RECENTE ({r.get('Date', '?')}): {r.get('HomeTeam')} vs {r.get('AwayTeam')}")
@@ -422,14 +400,14 @@ if modello["n_trasf"] < 6:
 if avvisi:
     st.warning("Dati limitati per: " + " • ".join(avvisi) + " → il modello usa più la media di lega.")
 
-# 1X2 in evidenza
+# 1X2
 st.markdown("### Esito Finale (1X2)")
 c1, c2, c3 = st.columns(3)
 c1.metric("1 - Casa", f"{modello['prob_1']:.1f}%")
 c2.metric("X - Pareggio", f"{modello['prob_X']:.1f}%")
 c3.metric("2 - Trasferta", f"{modello['prob_2']:.1f}%")
 
-# Goal e Under/Over
+# Goal / No Goal + Under/Over
 col_a, col_b = st.columns(2)
 with col_a:
     st.markdown("### Goal / No Goal")
@@ -455,40 +433,29 @@ with col_d:
     st.markdown("### Multigol Ospite")
     st.dataframe(crea_tabella(modello["multigol_trasf"], "Intervallo"), use_container_width=True, hide_index=True)
 
-# Combo rapide
-st.markdown("### Combo Favorite")
-st.dataframe(crea_tabella(modello["combo"], "Combinazione"), use_container_width=True, hide_index=True)
+# ========== TOP 5 COMBO ==========
+st.markdown("### Top 5 Combo")
 
-# Costruttore combo libera
-st.markdown("### Costruisci la tua Combo")
-st.caption("Seleziona i filtri che vuoi combinare. La probabilità viene calcolata correttamente sulla griglia congiunta.")
+combo_estese = {
+    "1 + Goal": modello["combo"]["1 + Goal"],
+    "1 + Over 2.5": modello["combo"]["1 + Over 2.5"],
+    "X + Under 2.5": modello["combo"]["X + Under 2.5"],
+    "2 + Goal": modello["combo"]["2 + Goal"],
+    "Goal": modello["prob_goal"],
+    "Over 2.5": 100 - modello["prob_under"][2.5],
+    "Under 2.5": modello["prob_under"][2.5],
+    "1": modello["prob_1"],
+    "X": modello["prob_X"],
+    "2": modello["prob_2"],
+}
 
-cc1, cc2, cc3 = st.columns(3)
-with cc1:
-    segno_sel = st.selectbox("Segno", ["Nessun filtro", "1", "X", "2"])
-with cc2:
-    soglia_sel = st.selectbox("Soglia gol", ["Nessun filtro", "1.5", "2.5", "3.5"])
-    tipo_sel = st.radio("Tipo", ["Over", "Under"], horizontal=True, disabled=(soglia_sel == "Nessun filtro"))
-with cc3:
-    gg_sel = st.selectbox("Gol / No Gol", ["Nessun filtro", "Goal", "NoGoal"])
+top5 = dict(sorted(combo_estese.items(), key=lambda x: x[1], reverse=True)[:5])
 
-if segno_sel != "Nessun filtro" or soglia_sel != "Nessun filtro" or gg_sel != "Nessun filtro":
-    prob_combo = calcola_combo_libera(
-        modello["griglia"],
-        None if segno_sel == "Nessun filtro" else segno_sel,
-        None if soglia_sel == "Nessun filtro" else float(soglia_sel),
-        tipo_sel if soglia_sel != "Nessun filtro" else None,
-        None if gg_sel == "Nessun filtro" else gg_sel
-    )
-    quota_equa = 100 / prob_combo if prob_combo > 0 else 0
-    pezzi = []
-    if segno_sel != "Nessun filtro":
-        pezzi.append(segno_sel)
-    if soglia_sel != "Nessun filtro":
-        pezzi.append(f"{tipo_sel} {soglia_sel}")
-    if gg_sel != "Nessun filtro":
-        pezzi.append(gg_sel)
-    st.success(f"**{' + '.join(pezzi)}**  →  Probabilità: **{prob_combo:.1f}%**   |   Quota equa minima: **{quota_equa:.2f}**")
+st.dataframe(
+    crea_tabella(top5, "Combo"),
+    use_container_width=True,
+    hide_index=True
+)
 
 # Scontri diretti
 st.markdown("### Ultimi Scontri Diretti")
