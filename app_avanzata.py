@@ -506,6 +506,52 @@ def esegui_backtest_leggero(dati_completi, rho, ewma_span, emivita, df_globale_v
 
 
 # =====================================================================
+# 🔧 CONFRONTO MULTI-SOGLIA — stesso principio di "Confronta soglie"
+# già usato nell'App Risultati Fissi: il modello viene calcolato UNA SOLA
+# volta per partita e valutato contemporaneamente contro tutte le soglie EV,
+# così vediamo in un colpo solo quanto la scelta della soglia "corregge" il
+# win rate, invece di doverle provare una alla volta.
+# =====================================================================
+def esegui_backtest_multi_soglia(dati_completi, rho, ewma_span, emivita, df_globale_vuoto, soglie_ev, usa_oos):
+    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati_completi.columns)
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    ha_stagione = 'Stagione' in tutte.columns
+
+    if usa_oos and ha_stagione:
+        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+    else:
+        indici = list(range(15, len(tutte)))
+
+    if not indici:
+        return None
+
+    stat = {s: {"n_bet": 0, "n_win": 0} for s in soglie_ev}
+
+    for i in indici:
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, df_globale_vuoto, data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+        quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
+        if quote is None: continue
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        for segno, prob, q_equa in [('1', m['prob_1'], quote['q_casa_equa']),
+                                     ('X', m['prob_X'], quote['q_x_equa']),
+                                     ('2', m['prob_2'], quote['q_trasf_equa'])]:
+            ev = (prob / 100.0) * q_equa
+            vinta = (segno == esito)
+            for s in soglie_ev:
+                if ev >= s:
+                    stat[s]["n_bet"] += 1
+                    if vinta:
+                        stat[s]["n_win"] += 1
+
+    return {"stat": stat, "n_partite_valutate": len(indici)}
+
+
+# =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
@@ -572,6 +618,32 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 c1, c2 = st.columns(2)
                 c1.metric("Scommesse valutate", risultato_bt["n_bet"])
                 c2.metric("Win rate", f"{win_rate_bt:.1f}%")
+
+        st.divider()
+        st.write("**📊 Confronta tutte le soglie in un colpo solo**")
+        st.caption("Vede se salire con la soglia EV migliora davvero il win rate (segnale reale) "
+                   "o resta piatto (la soglia non sta filtrando nulla di utile).")
+        if st.button("📊 Confronta tutte le soglie"):
+            with st.spinner("Calcolo in corso (una sola passata sui dati per tutte le soglie)..."):
+                SOGLIE_EV_CONFRONTO = [1.0, 1.05, 1.10, 1.15]
+                risultato_multi = esegui_backtest_multi_soglia(dati, rho_val, ewma_span_val, emivita_val,
+                                                                pd.DataFrame(), SOGLIE_EV_CONFRONTO, usa_oos_bt)
+            if risultato_multi is None:
+                st.warning("⚠️ Nessuna partita di stagione corrente disponibile per il confronto.")
+            else:
+                righe_confronto = []
+                for s in SOGLIE_EV_CONFRONTO:
+                    d = risultato_multi["stat"][s]
+                    win_rate_s = (d["n_win"] / d["n_bet"] * 100) if d["n_bet"] > 0 else None
+                    righe_confronto.append({
+                        "Soglia EV": f"≥{s:.2f}",
+                        "Scommesse": d["n_bet"],
+                        "Win rate": f"{win_rate_s:.1f}%" if win_rate_s is not None else "—",
+                    })
+                st.table(pd.DataFrame(righe_confronto))
+                st.caption("Nota: a soglie alte il numero di scommesse cala molto — con pochi casi "
+                           "un win rate migliore può essere anche solo rumore statistico. Guarda "
+                           "sempre insieme quante scommesse restano, non solo la percentuale.")
 
 else:
     if not api_key_input:
