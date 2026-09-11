@@ -109,13 +109,17 @@ def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def carica_dati_campionato(id_fd):
+    """FIX B — aggiunto il tag 'Stagione' (precedente/corrente), necessario
+    per poter validare il value bet SOLO sui risultati reali più recenti,
+    non su quelli già usati per calibrare le medie di lega."""
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
-    for codice in [codice_precedente, codice_corrente]:
+    for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
         url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
         df, _ = scarica_csv_robusto(url)
         if df is not None:
             df.columns = df.columns.str.strip()
+            df['Stagione'] = label
             frames.append(df)
     if frames:
         dati = pd.concat(frames, ignore_index=True, sort=False)
@@ -408,6 +412,100 @@ def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
 
 
 # =====================================================================
+# 🔧 PUNTO C — STIMA APPROSSIMATA DELLA QUOTA COMBO
+# Nessun bookmaker pubblica una quota per combo libere tipo "1 + Over 2.5 +
+# Goal" nei file gratuiti — solo per i mercati singoli (1X2, Over/Under
+# 2.5). Qui stimiamo una quota "come se" i mercati fossero indipendenti
+# (moltiplicando le quote eque dei singoli mercati disponibili) — è
+# un'APPROSSIMAZIONE, non un dato di mercato reale: segno e gol totali
+# nella stessa partita sono in una certa misura correlati, quindi il numero
+# vero si discosterà da questo. Il componente Gol/No Gol non ha una quota
+# disponibile nel file, quindi non entra nella stima — etichettato chiaramente.
+# =====================================================================
+def classifica_colonne_over_under(colonne, soglia="2.5"):
+    over_cols = [c for c in colonne if c.endswith(f'>{soglia}')]
+    under_cols = [c for c in colonne if c.endswith(f'<{soglia}')]
+    return over_cols, under_cols
+
+
+def quote_over_under_normalizzate(riga, colonne_over, colonne_under):
+    v_over = [riga[c] for c in colonne_over if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    v_under = [riga[c] for c in colonne_under if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    if not (v_over and v_under): return None
+    q_over, q_under = sum(v_over)/len(v_over), sum(v_under)/len(v_under)
+    pi_over, pi_under = 1/q_over, 1/q_under
+    overround = pi_over + pi_under
+    return {"q_over_equa": overround/pi_over, "q_under_equa": overround/pi_under, "n_bookmakers": len(v_over)}
+
+
+def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, quote_ou_25):
+    """Ritorna (quota_stimata_o_None, lista_componenti_non_prezzate)."""
+    fattori = []
+    non_prezzate = []
+    if segno:
+        if quote_1x2:
+            mappa = {"1": quote_1x2["q_casa_equa"], "X": quote_1x2["q_x_equa"], "2": quote_1x2["q_trasf_equa"]}
+            fattori.append(mappa[segno])
+        else:
+            non_prezzate.append(f"segno {segno}")
+    if soglia_gol is not None and tipo_soglia:
+        if soglia_gol == 2.5 and quote_ou_25:
+            fattori.append(quote_ou_25["q_over_equa"] if tipo_soglia == "Over" else quote_ou_25["q_under_equa"])
+        else:
+            non_prezzate.append(f"{tipo_soglia} {soglia_gol}")
+    quota = None
+    if fattori:
+        quota = 1.0
+        for f in fattori:
+            quota *= f
+    return quota, non_prezzate
+
+
+# =====================================================================
+# 🔧 PUNTO B — VALIDAZIONE STORICA LEGGERA DEL VALUE BET 1X2
+# Stesso principio già validato nell'App Risultati Fissi (backtest
+# semplificato: solo win rate, niente gestione puntata/Kelly). Simula "se
+# avessi scommesso ogni volta che il value bet segnalava valore, quante
+# volte avrei avuto ragione?" — no-look-ahead, usa solo dati precedenti a
+# ciascuna partita.
+# =====================================================================
+def esegui_backtest_leggero(dati_completi, rho, ewma_span, emivita, df_globale_vuoto, soglia_ev, usa_oos):
+    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati_completi.columns)
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    ha_stagione = 'Stagione' in tutte.columns
+
+    if usa_oos and ha_stagione:
+        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+    else:
+        indici = list(range(15, len(tutte)))
+
+    if not indici:
+        return None
+
+    n_bet, n_win = 0, 0
+    for i in indici:
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, df_globale_vuoto, data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+        quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
+        if quote is None: continue
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        for segno, prob, q_equa in [('1', m['prob_1'], quote['q_casa_equa']),
+                                     ('X', m['prob_X'], quote['q_x_equa']),
+                                     ('2', m['prob_2'], quote['q_trasf_equa'])]:
+            ev = (prob / 100.0) * q_equa
+            if ev >= soglia_ev:
+                n_bet += 1
+                if segno == esito:
+                    n_win += 1
+
+    return {"n_bet": n_bet, "n_win": n_win, "n_partite_valutate": len(indici)}
+
+
+# =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
@@ -449,6 +547,31 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
         mappa_partite.append(r.to_dict())
     df_globale = pd.DataFrame()
     is_coppa = False
+
+    with st.expander("📈 Verifica storica (backtest) del Value Bet 1X2"):
+        st.caption("Simula: 'se avessi scommesso ogni volta che il Value Bet segnalava valore, "
+                   "quante volte avrei avuto ragione?' — no-look-ahead, solo win rate (nessuna "
+                   "gestione della puntata).")
+        c_bt1, c_bt2 = st.columns(2)
+        with c_bt1:
+            soglia_ev_bt = st.select_slider("Soglia EV minima", options=[1.0, 1.05, 1.10, 1.15], value=1.0)
+        with c_bt2:
+            usa_oos_bt = st.checkbox("Valida solo su stagione corrente (out-of-sample)", value=True)
+        if st.button("📈 Esegui backtest"):
+            with st.spinner("Backtest in corso..."):
+                risultato_bt = esegui_backtest_leggero(dati, rho_val, ewma_span_val, emivita_val,
+                                                        pd.DataFrame(), soglia_ev_bt, usa_oos_bt)
+            if risultato_bt is None:
+                st.warning("⚠️ Nessuna partita di stagione corrente disponibile per la validazione. "
+                          "Disattiva l'opzione per un test provvisorio sui dati completi.")
+            elif risultato_bt["n_bet"] == 0:
+                st.warning(f"Nessuna scommessa avrebbe superato EV≥{soglia_ev_bt} "
+                          f"sulle {risultato_bt['n_partite_valutate']} partite valutate.")
+            else:
+                win_rate_bt = risultato_bt["n_win"] / risultato_bt["n_bet"] * 100
+                c1, c2 = st.columns(2)
+                c1.metric("Scommesse valutate", risultato_bt["n_bet"])
+                c2.metric("Win rate", f"{win_rate_bt:.1f}%")
 
 else:
     if not api_key_input:
@@ -545,10 +668,14 @@ else:
         df_1x2 = crea_tabella({"1 (Casa)": modello['prob_1'], "X (Pareggio)": modello['prob_X'], "2 (Trasferta)": modello['prob_2']}, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
 
+        quote, quote_ou_25 = None, None  # usate più sotto per la stima combo approssimata (Punto C)
+
         if not is_coppa:
             st.markdown("### 💰 Controllo Value Bet (media multi-bookmaker, quote depurate dal margine)")
             colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati.columns)
             quote = quote_mercato_normalizzate(partita_sel, colonne_h, colonne_d, colonne_a)
+            colonne_over, colonne_under = classifica_colonne_over_under(dati.columns, "2.5")
+            quote_ou_25 = quote_over_under_normalizzate(partita_sel, colonne_over, colonne_under)
             if quote:
                 ev_1 = (modello['prob_1'] / 100.0) * quote['q_casa_equa']
                 ev_x = (modello['prob_X'] / 100.0) * quote['q_x_equa']
@@ -607,7 +734,7 @@ else:
         # funzione calcola_combo_libera del motore libero qui sotto — nessuna
         # logica duplicata, un solo posto dove le combo vengono calcolate.
         # =====================================================================
-        st.markdown("### 🏆 Top 5 Combo Automatiche (su Over/Under 2.5)")
+        st.markdown("### 🏆 Top 4 Combo Automatiche (su Over/Under 2.5)")
         st.caption("Tutte le 12 combinazioni possibili (1/X/2 × Gol/No Gol × Over/Under 2.5), "
                    "ordinate per probabilità — per scoprire al volo le più forti senza cercarle a mano.")
         tutte_le_combo = {}
@@ -615,12 +742,25 @@ else:
             for gg_auto in ["Goal", "NoGoal"]:
                 for tipo_auto in ["Over", "Under"]:
                     chiave = f"{segno_auto} + {'Gol' if gg_auto=='Goal' else 'No Gol'} + {tipo_auto} 2.5"
-                    tutte_le_combo[chiave] = calcola_combo_libera(
-                        modello['griglia'], segno=segno_auto, soglia_gol=2.5,
-                        tipo_soglia=tipo_auto, gol_nogol=gg_auto
-                    )
-        top5_combo = dict(sorted(tutte_le_combo.items(), key=lambda x: x[1], reverse=True)[:5])
-        st.dataframe(crea_tabella(top5_combo, "Combo"), use_container_width=True, hide_index=True)
+                    tutte_le_combo[chiave] = {
+                        "prob": calcola_combo_libera(modello['griglia'], segno=segno_auto, soglia_gol=2.5,
+                                                     tipo_soglia=tipo_auto, gol_nogol=gg_auto),
+                        "segno": segno_auto, "tipo": tipo_auto,
+                    }
+        top4_combo = dict(sorted(tutte_le_combo.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
+
+        righe_top4 = []
+        for chiave, info_c in top4_combo.items():
+            q_stimata, non_prezzate = stima_quota_combo_approssimata(info_c["segno"], 2.5, info_c["tipo"], quote, quote_ou_25)
+            righe_top4.append({
+                "Combo": chiave,
+                "Probabilità (%)": f"{info_c['prob']:.1f}%",
+                "Quota stimata*": f"~{q_stimata:.2f}" if q_stimata else "n/d",
+            })
+        st.dataframe(pd.DataFrame(righe_top4), use_container_width=True, hide_index=True)
+        st.caption("*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
+                   "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
+                   "non entra nella stima: il numero reale del bookmaker sarà diverso.")
 
         # =====================================================================
         # 🎯 FIX #5 — COSTRUISCI LA TUA COMBO (motore libero)
@@ -652,7 +792,18 @@ else:
                                               tipo_soglia=tipo_p, gol_nogol=gg_p)
             quota_equa_combo = 100.0 / prob_combo if prob_combo > 0 else 0.0
             pezzi = [p for p in [segno_p, f"{tipo_p} {soglia_p}" if soglia_p else None, gg_p] if p]
-            st.success(f"**{' + '.join(pezzi)}** → Probabilità: **{prob_combo:.1f}%** — Quota equa minima: **{quota_equa_combo:.2f}**")
+            st.success(f"**{' + '.join(pezzi)}** → Probabilità: **{prob_combo:.1f}%** — Quota equa minima (dal modello): **{quota_equa_combo:.2f}**")
+
+            if not is_coppa:
+                q_stimata_libera, non_prezzate = stima_quota_combo_approssimata(segno_p, soglia_p, tipo_p, quote, quote_ou_25)
+                if q_stimata_libera:
+                    nota_non_prezzate = f" (esclude: {', '.join(non_prezzate)})" if non_prezzate else ""
+                    st.caption(f"💡 Quota di MERCATO stimata (approssimata, 1X2 × O/U come indipendenti): "
+                               f"~{q_stimata_libera:.2f}{nota_non_prezzate} — non è un dato reale del "
+                               f"bookmaker, solo un'approssimazione.")
+                else:
+                    st.caption("💡 Nessuna componente di questa combo ha una quota di mercato disponibile "
+                              "nel file — impossibile stimare una quota approssimata.")
 
         st.divider()
         st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
