@@ -87,6 +87,12 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
 # "www" per il traffico non-UK)
 # =====================================================================
 def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
+    """FIX #11 — BOM (Byte Order Mark): fixtures.csv inizia con un carattere
+    invisibile Unicode che, se non gestito, si attacca al nome della prima
+    colonna ("Div" diventa "\\ufeffDiv"), facendo fallire in silenzio ogni
+    controllo tipo "if 'Div' in colonne" — nessuna fixture futura veniva mai
+    trovata, su nessun campionato, per questo motivo esatto. 'utf-8-sig' lo
+    rimuove in fase di decodifica; non fa danno se il file non ha il BOM."""
     varianti_url = [url]
     if "://www." in url:
         varianti_url.append(url.replace("://www.", "://"))
@@ -99,7 +105,10 @@ def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
             try:
                 resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
                 resp.raise_for_status()
-                return pd.read_csv(io.StringIO(resp.text)), None
+                testo = resp.content.decode('utf-8-sig', errors='replace')
+                df = pd.read_csv(io.StringIO(testo))
+                df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]  # rete di sicurezza extra
+                return df, None
             except Exception as e:
                 ultimo_errore = str(e)
         if tentativo < tentativi - 1:
