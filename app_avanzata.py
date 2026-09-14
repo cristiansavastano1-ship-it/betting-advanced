@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -725,7 +724,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                    "gestione della puntata).")
         c_bt1, c_bt2 = st.columns(2)
         with c_bt1:
-            soglia_ev_bt = st.select_slider("Soglia EV minima", options=[1.0, 1.05, 1.10, 1.15], value=1.0)
+            soglia_ev_bt = st.select_slider("Soglia EV minima", options=[1.05, 1.10, 1.15], value=1.05)
         with c_bt2:
             usa_oos_bt = st.checkbox("Valida solo su stagione corrente (out-of-sample)", value=True)
         if st.button("📈 Esegui backtest"):
@@ -750,7 +749,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                    "o resta piatto (la soglia non sta filtrando nulla di utile).")
         if st.button("📊 Confronta tutte le soglie"):
             with st.spinner("Calcolo in corso (una sola passata sui dati per tutte le soglie)..."):
-                SOGLIE_EV_CONFRONTO = [1.0, 1.05, 1.10, 1.15]
+                SOGLIE_EV_CONFRONTO = [1.05, 1.10, 1.15]
                 risultato_multi = esegui_backtest_multi_soglia(dati, rho_val, ewma_span_val, emivita_val,
                                                                 pd.DataFrame(), SOGLIE_EV_CONFRONTO, usa_oos_bt)
             if risultato_multi is None:
