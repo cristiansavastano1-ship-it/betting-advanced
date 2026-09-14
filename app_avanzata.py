@@ -564,6 +564,54 @@ def esegui_backtest_multi_soglia(dati_completi, rho, ewma_span, emivita, df_glob
 
 
 # =====================================================================
+# 🔧 BACKTEST SENZA FILTRO — accuratezza pura del modello
+# Diverso dal value bet (che filtra per EV/soglia): qui valutiamo semplicemente
+# "quante volte la previsione principale del modello (il segno più probabile)
+# ha indovinato il risultato vero?", su TUTTE le partite disponibili, senza
+# nessun filtro — la metrica più diretta e senza sorprese sulla bontà di base
+# del modello, utile per mandarmi i numeri e controllarli insieme.
+# =====================================================================
+def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None, usa_calibrazione=False):
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    ha_stagione = 'Stagione' in tutte.columns
+
+    if usa_oos and ha_stagione:
+        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+    else:
+        indici = list(range(15, len(tutte)))
+
+    if not indici:
+        return None
+
+    calib_info = carica_calibratore(id_fd, "1x2") if (usa_calibrazione and id_fd) else None
+    calibratore = calib_info["calibratore"] if calib_info else None
+
+    n_partite, n_corrette = 0, 0
+    per_segno = {"1": {"previste": 0, "corrette": 0}, "X": {"previste": 0, "corrette": 0}, "2": {"previste": 0, "corrette": 0}}
+
+    for i in indici:
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+        if calibratore is not None:
+            m = applica_calibrazione_1x2(m, calibratore)
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        probabilita = {"1": m['prob_1'], "X": m['prob_X'], "2": m['prob_2']}
+        previsione_principale = max(probabilita, key=probabilita.get)
+
+        n_partite += 1
+        per_segno[previsione_principale]["previste"] += 1
+        if previsione_principale == esito:
+            n_corrette += 1
+            per_segno[previsione_principale]["corrette"] += 1
+
+    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_segno": per_segno}
+
+
+# =====================================================================
 # 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 12 combo automatiche)
 # Stessa tecnica isotonic regression già validata nell'App Risultati Fissi.
 # Un correttore per 1X2 (corregge "Esito Finale" e il Value Bet), più uno
