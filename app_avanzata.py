@@ -1,11 +1,15 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import io
 import time
-from datetime import date
+import os
+import pickle
+from datetime import datetime, date
 from scipy.stats import poisson
+from sklearn.isotonic import IsotonicRegression
 
 st.set_page_config(page_title="COMBO - Advanced Betting Model", page_icon="⚽", layout="centered")
 
@@ -561,6 +565,112 @@ def esegui_backtest_multi_soglia(dati_completi, rho, ewma_span, emivita, df_glob
 
 
 # =====================================================================
+# 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 12 combo automatiche)
+# Stessa tecnica isotonic regression già validata nell'App Risultati Fissi.
+# Un correttore per 1X2 (corregge "Esito Finale" e il Value Bet), più uno
+# separato per ciascuna delle 12 combinazioni automatiche (segno × Gol/No
+# Gol × Over/Under 2.5) — la verità per allenarle è già nei risultati reali
+# che scarichiamo (nessuna fonte dati nuova serve). Le combo libere con
+# soglie diverse da 2.5 restano SENZA calibrazione: te lo segnaliamo,
+# non lo nascondiamo.
+# =====================================================================
+LE_12_COMBO = [(s, g, t) for s in ["1", "X", "2"] for g in ["Goal", "NoGoal"] for t in ["Over", "Under"]]
+
+
+def _path_calibratore(id_fd, chiave="1x2"):
+    return f"calibratore_combo_{chiave}_{id_fd}.pkl"
+
+
+def _salva_calibratore(id_fd, chiave, calibratore, n_oss):
+    try:
+        with open(_path_calibratore(id_fd, chiave), "wb") as f:
+            pickle.dump({"calibratore": calibratore, "n_osservazioni": n_oss,
+                         "timestamp": datetime.now().isoformat(timespec="minutes")}, f)
+    except Exception:
+        pass
+
+
+def carica_calibratore(id_fd, chiave="1x2"):
+    path = _path_calibratore(id_fd, chiave)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _allena_isotonic(osservazioni):
+    if len(osservazioni) < 100:
+        return None
+    x = np.array([p for p, _ in osservazioni])
+    y = np.array([1.0 if av else 0.0 for _, av in osservazioni])
+    calibratore = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
+    calibratore.fit(x, y)
+    return calibratore
+
+
+def applica_calibrazione_1x2(modello, calibratore):
+    if calibratore is None or modello is None:
+        return modello
+    p1 = float(calibratore.predict([modello['prob_1']/100])[0])
+    px = float(calibratore.predict([modello['prob_X']/100])[0])
+    p2 = float(calibratore.predict([modello['prob_2']/100])[0])
+    tot = p1 + px + p2
+    if tot <= 0:
+        return modello
+    m = dict(modello)
+    m['prob_1'], m['prob_X'], m['prob_2'] = p1/tot*100, px/tot*100, p2/tot*100
+    return m
+
+
+def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
+    """Un'unica passata sui dati storici: per ogni partita calcola il modello
+    UNA volta, poi costruisce le osservazioni (predetto, avverato) per 1X2 e
+    per tutte e 12 le combo insieme — efficiente, una sola passata."""
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    oss_1x2 = []
+    oss_combo = {c: [] for c in LE_12_COMBO}
+
+    for i in range(15, len(tutte)):
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        oss_1x2.append((m['prob_1']/100, esito == '1'))
+        oss_1x2.append((m['prob_X']/100, esito == 'X'))
+        oss_1x2.append((m['prob_2']/100, esito == '2'))
+
+        tot_gol_reale = partita['FTHG'] + partita['FTAG']
+        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
+        for (segno_c, gg_c, tipo_c) in LE_12_COMBO:
+            prob_c = calcola_combo_libera(m['griglia'], segno=segno_c, soglia_gol=2.5, tipo_soglia=tipo_c, gol_nogol=gg_c)
+            avverato_c = (segno_c == esito) and \
+                         ((gg_c == "Goal") == entrambe_reale) and \
+                         ((tipo_c == "Over") == (tot_gol_reale > 2.5))
+            oss_combo[(segno_c, gg_c, tipo_c)].append((prob_c/100, avverato_c))
+
+    risultati = {"1x2": {"n": len(oss_1x2), "ok": False}}
+    cal_1x2 = _allena_isotonic(oss_1x2)
+    if cal_1x2:
+        _salva_calibratore(id_fd, "1x2", cal_1x2, len(oss_1x2))
+        risultati["1x2"]["ok"] = True
+
+    for chiave_c, oss_c in oss_combo.items():
+        nome_chiave = f"{chiave_c[0]}_{chiave_c[1]}_{chiave_c[2]}"
+        cal_c = _allena_isotonic(oss_c)
+        risultati[nome_chiave] = {"n": len(oss_c), "ok": cal_c is not None}
+        if cal_c:
+            _salva_calibratore(id_fd, nome_chiave, cal_c, len(oss_c))
+
+    return risultati
+
+
+# =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
@@ -571,9 +681,15 @@ with st.sidebar:
     api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password",
                                    help="Gratuita: football-data.org/client/register")
     st.divider()
-    rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
-    ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
-    emivita_val = st.slider("Decadimento Temporale (Giorni)", 30, 365, 180, 10)
+    usa_calibrazione = st.checkbox(
+        "🎯 Applica calibrazione (se allenata per questo campionato)",
+        value=True,
+        help="Corregge le probabilità sulla base della verifica storica. Disattiva per confrontare prima/dopo."
+    )
+    with st.expander("⚙️ Impostazioni avanzate (di solito non serve toccarle)"):
+        rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
+        ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
+        emivita_val = st.slider("Decadimento Temporale (Giorni)", 30, 365, 180, 10)
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
@@ -654,6 +770,31 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                            "un win rate migliore può essere anche solo rumore statistico. Guarda "
                            "sempre insieme quante scommesse restano, non solo la percentuale.")
 
+        st.divider()
+        st.write("**🎯 Calibrazione (1X2 + le 12 combo automatiche)**")
+        st.caption("Allena i correttori su tutto lo storico disponibile. Una sola passata sui dati "
+                   "calcola il modello una volta per partita e allena tutti i 13 correttori insieme "
+                   "(1X2 + le 12 combinazioni segno × Gol/No Gol × Over/Under 2.5).")
+        if st.button("🎯 Allena tutte le calibrazioni per questo campionato"):
+            with st.spinner("Allenamento in corso (può richiedere qualche secondo)..."):
+                risultati_calib = allena_tutte_le_calibrazioni(dati, rho_val, ewma_span_val, emivita_val, id_fd)
+            ok_1x2 = risultati_calib["1x2"]["ok"]
+            n_combo_ok = sum(1 for k, v in risultati_calib.items() if k != "1x2" and v["ok"])
+            if ok_1x2:
+                st.success(f"✅ 1X2: calibrato su {risultati_calib['1x2']['n']} osservazioni.")
+            else:
+                st.warning(f"⚠️ 1X2: campione insufficiente ({risultati_calib['1x2']['n']} osservazioni, "
+                          f"ne servono almeno 100).")
+            st.write(f"**Combo calibrate con successo: {n_combo_ok} su 12.**")
+            righe_combo_calib = []
+            for chiave, v in risultati_calib.items():
+                if chiave == "1x2": continue
+                righe_combo_calib.append({"Combo": chiave.replace("_", " "), "Osservazioni": v["n"],
+                                          "Calibrata": "✅" if v["ok"] else "⚠️ campione scarso"})
+            st.dataframe(pd.DataFrame(righe_combo_calib), use_container_width=True, hide_index=True)
+            st.caption("Le combo più rare (es. 'X + NoGoal + Over') hanno naturalmente meno osservazioni "
+                       "delle più comuni — è normale, non un errore.")
+
 else:
     if not api_key_input:
         st.warning("⚠️ Inserisci la tua chiave API di football-data.org nella barra laterale per sbloccare le coppe europee.")
@@ -721,10 +862,19 @@ else:
                                         rho_val, ewma_span_val, emivita_val, df_globale_filtrato,
                                         data_riferimento=data_rif_sel if pd.notna(data_rif_sel) else None)
 
+    calib_1x2_info = None
+    if modello is not None and not is_coppa and usa_calibrazione:
+        calib_1x2_info = carica_calibratore(id_fd, "1x2")
+        if calib_1x2_info:
+            modello = applica_calibrazione_1x2(modello, calib_1x2_info["calibratore"])
+
     if modello is None:
         st.warning(f"⚠️ Impossibile elaborare il match per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}**.")
     else:
         st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
+        if calib_1x2_info:
+            st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
+                       f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
 
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
@@ -816,32 +966,57 @@ else:
         # logica duplicata, un solo posto dove le combo vengono calcolate.
         # =====================================================================
         st.markdown("### 🏆 Top 4 Combo Automatiche (su Over/Under 2.5)")
-        st.caption("Tutte le 12 combinazioni possibili (1/X/2 × Gol/No Gol × Over/Under 2.5), "
-                   "ordinate per probabilità — per scoprire al volo le più forti senza cercarle a mano.")
+        st.caption("Tutte le 12 combinazioni possibili (1/X/2 × Gol/No Gol × Over/Under 2.5), calibrate "
+                   "se disponibile, filtrate per affidabilità (esclude combo troppo rare o su dati scarsi) "
+                   "e ordinate per probabilità.")
+
+        # Punto A — filtro di affidabilità: escludiamo le combo troppo rare
+        # (rumore, non segnale) o calcolate su squadre con pochi dati specifici.
+        SOGLIA_MIN_PROB_COMBO = 8.0  # sotto questa probabilità, troppo raro per essere utile
+        dati_scarsi = bool(avvisi)
+
         tutte_le_combo = {}
         for segno_auto in ["1", "X", "2"]:
             for gg_auto in ["Goal", "NoGoal"]:
                 for tipo_auto in ["Over", "Under"]:
-                    chiave = f"{segno_auto} + {'Gol' if gg_auto=='Goal' else 'No Gol'} + {tipo_auto} 2.5"
-                    tutte_le_combo[chiave] = {
-                        "prob": calcola_combo_libera(modello['griglia'], segno=segno_auto, soglia_gol=2.5,
-                                                     tipo_soglia=tipo_auto, gol_nogol=gg_auto),
-                        "segno": segno_auto, "tipo": tipo_auto,
+                    prob_grezza = calcola_combo_libera(modello['griglia'], segno=segno_auto, soglia_gol=2.5,
+                                                        tipo_soglia=tipo_auto, gol_nogol=gg_auto)
+                    nome_chiave = f"{segno_auto}_{gg_auto}_{tipo_auto}"
+                    prob_finale = prob_grezza
+                    calib_combo_info = None
+                    if not is_coppa and usa_calibrazione:
+                        calib_combo_info = carica_calibratore(id_fd, nome_chiave)
+                        if calib_combo_info:
+                            prob_finale = float(calib_combo_info["calibratore"].predict([prob_grezza/100])[0]) * 100
+                    chiave_vis = f"{segno_auto} + {'Gol' if gg_auto=='Goal' else 'No Gol'} + {tipo_auto} 2.5"
+                    tutte_le_combo[chiave_vis] = {
+                        "prob": prob_finale, "segno": segno_auto, "tipo": tipo_auto,
+                        "calibrata": calib_combo_info is not None,
                     }
-        top4_combo = dict(sorted(tutte_le_combo.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
 
-        righe_top4 = []
-        for chiave, info_c in top4_combo.items():
-            q_stimata, non_prezzate = stima_quota_combo_approssimata(info_c["segno"], 2.5, info_c["tipo"], quote, quote_ou_25)
-            righe_top4.append({
-                "Combo": chiave,
-                "Probabilità (%)": f"{info_c['prob']:.1f}%",
-                "Quota stimata*": f"~{q_stimata:.2f}" if q_stimata else "n/d",
-            })
-        st.dataframe(pd.DataFrame(righe_top4), use_container_width=True, hide_index=True)
-        st.caption("*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
-                   "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
-                   "non entra nella stima: il numero reale del bookmaker sarà diverso.")
+        combo_affidabili = {k: v for k, v in tutte_le_combo.items() if v["prob"] >= SOGLIA_MIN_PROB_COMBO}
+        top4_combo = dict(sorted(combo_affidabili.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
+
+        if dati_scarsi:
+            st.warning("⚠️ Combo calcolate su dati limitati per una delle due squadre (vedi avviso sopra) "
+                      "— trattale con più cautela del solito.")
+        if not top4_combo:
+            st.info(f"Nessuna combo sopra la soglia minima di affidabilità ({SOGLIA_MIN_PROB_COMBO}%) "
+                   "per questa partita.")
+        else:
+            righe_top4 = []
+            for chiave, info_c in top4_combo.items():
+                q_stimata, non_prezzate = stima_quota_combo_approssimata(info_c["segno"], 2.5, info_c["tipo"], quote, quote_ou_25)
+                righe_top4.append({
+                    "Combo": chiave + (" 🎯" if info_c["calibrata"] else ""),
+                    "Probabilità (%)": f"{info_c['prob']:.1f}%",
+                    "Quota stimata*": f"~{q_stimata:.2f}" if q_stimata else "n/d",
+                })
+            st.dataframe(pd.DataFrame(righe_top4), use_container_width=True, hide_index=True)
+            st.caption("🎯 = probabilità corretta con calibrazione specifica per questa combo. "
+                       "*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
+                       "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
+                       "non entra nella stima: il numero reale del bookmaker sarà diverso.")
 
         # =====================================================================
         # 🎯 FIX #5 — COSTRUISCI LA TUA COMBO (motore libero)
