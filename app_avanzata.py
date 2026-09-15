@@ -474,96 +474,6 @@ def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, qu
 
 
 # =====================================================================
-# 🔧 PUNTO B — VALIDAZIONE STORICA LEGGERA DEL VALUE BET 1X2
-# Stesso principio già validato nell'App Risultati Fissi (backtest
-# semplificato: solo win rate, niente gestione puntata/Kelly). Simula "se
-# avessi scommesso ogni volta che il value bet segnalava valore, quante
-# volte avrei avuto ragione?" — no-look-ahead, usa solo dati precedenti a
-# ciascuna partita.
-# =====================================================================
-def esegui_backtest_leggero(dati_completi, rho, ewma_span, emivita, df_globale_vuoto, soglia_ev, usa_oos):
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati_completi.columns)
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    ha_stagione = 'Stagione' in tutte.columns
-
-    if usa_oos and ha_stagione:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-
-    if not indici:
-        return None
-
-    n_bet, n_win = 0, 0
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, df_globale_vuoto, data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
-        if quote is None: continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        for segno, prob, q_equa in [('1', m['prob_1'], quote['q_casa_equa']),
-                                     ('X', m['prob_X'], quote['q_x_equa']),
-                                     ('2', m['prob_2'], quote['q_trasf_equa'])]:
-            ev = (prob / 100.0) * q_equa
-            if ev >= soglia_ev:
-                n_bet += 1
-                if segno == esito:
-                    n_win += 1
-
-    return {"n_bet": n_bet, "n_win": n_win, "n_partite_valutate": len(indici)}
-
-
-# =====================================================================
-# 🔧 CONFRONTO MULTI-SOGLIA — stesso principio di "Confronta soglie"
-# già usato nell'App Risultati Fissi: il modello viene calcolato UNA SOLA
-# volta per partita e valutato contemporaneamente contro tutte le soglie EV,
-# così vediamo in un colpo solo quanto la scelta della soglia "corregge" il
-# win rate, invece di doverle provare una alla volta.
-# =====================================================================
-def esegui_backtest_multi_soglia(dati_completi, rho, ewma_span, emivita, df_globale_vuoto, soglie_ev, usa_oos):
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati_completi.columns)
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    ha_stagione = 'Stagione' in tutte.columns
-
-    if usa_oos and ha_stagione:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-
-    if not indici:
-        return None
-
-    stat = {s: {"n_bet": 0, "n_win": 0} for s in soglie_ev}
-
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, df_globale_vuoto, data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
-        if quote is None: continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        for segno, prob, q_equa in [('1', m['prob_1'], quote['q_casa_equa']),
-                                     ('X', m['prob_X'], quote['q_x_equa']),
-                                     ('2', m['prob_2'], quote['q_trasf_equa'])]:
-            ev = (prob / 100.0) * q_equa
-            vinta = (segno == esito)
-            for s in soglie_ev:
-                if ev >= s:
-                    stat[s]["n_bet"] += 1
-                    if vinta:
-                        stat[s]["n_win"] += 1
-
-    return {"stat": stat, "n_partite_valutate": len(indici)}
-
-
-# =====================================================================
 # 🔧 BACKTEST SENZA FILTRO — accuratezza pura del modello
 # Diverso dal value bet (che filtra per EV/soglia): qui valutiamo semplicemente
 # "quante volte la previsione principale del modello (il segno più probabile)
@@ -721,7 +631,14 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
-st.caption("Modello statistico con combo libere e analisi value bet — Dixon-Coles + EWMA + shrinkage")
+st.caption("Modello statistico Dixon-Coles + EWMA + shrinkage, con combo automatiche e value bet")
+
+# Parametri del modello fissati ai valori di default validati — non più
+# esposti nell'interfaccia: erano controlli tecnici che richiedevano di
+# sapere cosa fanno per essere usati bene, e nell'uso normale non si toccano.
+rho_val = -0.10        # correzione Dixon-Coles (valore tipico da letteratura)
+ewma_span_val = 6      # finestra della forma recente
+emivita_val = 180      # decadimento temporale in giorni
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
@@ -733,10 +650,6 @@ with st.sidebar:
         value=True,
         help="Corregge le probabilità sulla base della verifica storica. Disattiva per confrontare prima/dopo."
     )
-    with st.expander("⚙️ Impostazioni avanzate (di solito non serve toccarle)"):
-        rho_val = st.slider("Correzione Dixon-Coles (ρ)", -0.20, 0.10, -0.10, 0.01)
-        ewma_span_val = st.slider("Finestra Forma Recente (EWMA)", 2, 15, 6, 1)
-        emivita_val = st.slider("Decadimento Temporale (Giorni)", 30, 365, 180, 10)
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
@@ -766,56 +679,58 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     df_globale = pd.DataFrame()
     is_coppa = False
 
-    with st.expander("📈 Verifica storica (backtest) del Value Bet 1X2"):
-        st.caption("Simula: 'se avessi scommesso ogni volta che il Value Bet segnalava valore, "
-                   "quante volte avrei avuto ragione?' — no-look-ahead, solo win rate (nessuna "
-                   "gestione della puntata).")
-        c_bt1, c_bt2 = st.columns(2)
-        with c_bt1:
-            soglia_ev_bt = st.select_slider("Soglia EV minima", options=[1.05, 1.10, 1.15], value=1.05)
-        with c_bt2:
-            usa_oos_bt = st.checkbox("Valida solo su stagione corrente (out-of-sample)", value=True)
-        if st.button("📈 Esegui backtest"):
-            with st.spinner("Backtest in corso..."):
-                risultato_bt = esegui_backtest_leggero(dati, rho_val, ewma_span_val, emivita_val,
-                                                        pd.DataFrame(), soglia_ev_bt, usa_oos_bt)
-            if risultato_bt is None:
-                st.warning("⚠️ Nessuna partita di stagione corrente disponibile per la validazione. "
-                          "Disattiva l'opzione per un test provvisorio sui dati completi.")
-            elif risultato_bt["n_bet"] == 0:
-                st.warning(f"Nessuna scommessa avrebbe superato EV≥{soglia_ev_bt} "
-                          f"sulle {risultato_bt['n_partite_valutate']} partite valutate.")
-            else:
-                win_rate_bt = risultato_bt["n_win"] / risultato_bt["n_bet"] * 100
-                c1, c2 = st.columns(2)
-                c1.metric("Scommesse valutate", risultato_bt["n_bet"])
-                c2.metric("Win rate", f"{win_rate_bt:.1f}%")
+    with st.expander("📈 Verifica storica (backtest)"):
+        st.caption("Quante volte la previsione principale del modello (il segno più probabile) "
+                   "ha indovinato il risultato vero — su TUTTE le partite disponibili, senza "
+                   "nessun filtro. Confronta stagione corrente e storico completo per vedere "
+                   "se il modello regge o se il risultato dipende dal periodo.")
 
-        st.divider()
-        st.write("**📊 Confronta tutte le soglie in un colpo solo**")
-        st.caption("Vede se salire con la soglia EV migliora davvero il win rate (segnale reale) "
-                   "o resta piatto (la soglia non sta filtrando nulla di utile).")
-        if st.button("📊 Confronta tutte le soglie"):
-            with st.spinner("Calcolo in corso (una sola passata sui dati per tutte le soglie)..."):
-                SOGLIE_EV_CONFRONTO = [1.05, 1.10, 1.15]
-                risultato_multi = esegui_backtest_multi_soglia(dati, rho_val, ewma_span_val, emivita_val,
-                                                                pd.DataFrame(), SOGLIE_EV_CONFRONTO, usa_oos_bt)
-            if risultato_multi is None:
-                st.warning("⚠️ Nessuna partita di stagione corrente disponibile per il confronto.")
-            else:
-                righe_confronto = []
-                for s in SOGLIE_EV_CONFRONTO:
-                    d = risultato_multi["stat"][s]
-                    win_rate_s = (d["n_win"] / d["n_bet"] * 100) if d["n_bet"] > 0 else None
-                    righe_confronto.append({
-                        "Soglia EV": f"≥{s:.2f}",
-                        "Scommesse": d["n_bet"],
-                        "Win rate": f"{win_rate_s:.1f}%" if win_rate_s is not None else "—",
-                    })
-                st.table(pd.DataFrame(righe_confronto))
-                st.caption("Nota: a soglie alte il numero di scommesse cala molto — con pochi casi "
-                           "un win rate migliore può essere anche solo rumore statistico. Guarda "
-                           "sempre insieme quante scommesse restano, non solo la percentuale.")
+        col_bt_a, col_bt_b = st.columns(2)
+        with col_bt_a:
+            cliccato_corrente = st.button("🎯 Backtest — solo stagione corrente")
+        with col_bt_b:
+            cliccato_tutto = st.button("📚 Backtest — tutto lo storico")
+
+        def mostra_risultato_backtest(risultato, etichetta):
+            if risultato is None:
+                st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
+                return
+            if risultato["n_partite"] == 0:
+                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile.")
+                return
+            win_rate_tot = risultato["n_corrette"] / risultato["n_partite"] * 100
+            st.write(f"**{etichetta}**")
+            c1, c2 = st.columns(2)
+            c1.metric("Partite valutate", risultato["n_partite"])
+            c2.metric("Accuratezza", f"{win_rate_tot:.1f}%")
+            righe_segno = []
+            for s, d in risultato["per_segno"].items():
+                wr_s = (d["corrette"]/d["previste"]*100) if d["previste"] > 0 else None
+                righe_segno.append({
+                    "Segno previsto": s, "Volte previsto": d["previste"],
+                    "Corrette": d["corrette"],
+                    "Accuratezza": f"{wr_s:.1f}%" if wr_s is not None else "—",
+                })
+            st.table(pd.DataFrame(righe_segno))
+
+        if cliccato_corrente:
+            with st.spinner("Backtest su stagione corrente..."):
+                ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
+                                                    True, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+            mostra_risultato_backtest(ris, "Solo stagione corrente (out-of-sample)")
+
+        if cliccato_tutto:
+            with st.spinner("Backtest su tutto lo storico (può richiedere più tempo)..."):
+                ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
+                                                    False, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+            mostra_risultato_backtest(ris, "Tutto lo storico disponibile")
+
+        if cliccato_corrente or cliccato_tutto:
+            st.caption("Se il modello prevede quasi sempre '1' e quasi mai 'X', è normale: il pareggio "
+                       "è statisticamente l'esito più difficile da prevedere, per qualunque modello. "
+                       "Un'accuratezza intorno al 45-55% su 1X2 è nella norma per modelli di questo tipo — "
+                       "il mercato stesso, con molte più informazioni, non fa enormemente meglio.")
+
 
         st.divider()
         st.write("**🎯 Calibrazione (1X2 + le 12 combo automatiche)**")
@@ -1064,49 +979,6 @@ else:
                        "*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
                        "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
                        "non entra nella stima: il numero reale del bookmaker sarà diverso.")
-
-        # =====================================================================
-        # 🎯 FIX #5 — COSTRUISCI LA TUA COMBO (motore libero)
-        # =====================================================================
-        st.divider()
-        st.markdown("### 🎯 Costruisci la tua combo")
-        st.caption("Combina segno + soglia gol + gol/no gol come vuoi (es. '1 + Over 2.5 + Goal', "
-                   "'X + Under 1.5 + NoGoal'). La probabilità è calcolata correttamente sulla griglia "
-                   "Poisson congiunta, non moltiplicando probabilità come se fossero indipendenti.")
-
-        cc1, cc2, cc3 = st.columns(3)
-        with cc1:
-            segno_combo = st.selectbox("Segno", ["Nessun filtro", "1", "X", "2"])
-        with cc2:
-            soglia_combo = st.selectbox("Soglia gol", ["Nessun filtro", "0.5", "1.5", "2.5", "3.5", "4.5"])
-            tipo_soglia_combo = st.radio("Tipo", ["Over", "Under"], horizontal=True, disabled=(soglia_combo == "Nessun filtro"))
-        with cc3:
-            gg_combo = st.selectbox("Gol/No Gol", ["Nessun filtro", "Goal", "NoGoal"])
-
-        segno_p = None if segno_combo == "Nessun filtro" else segno_combo
-        soglia_p = None if soglia_combo == "Nessun filtro" else float(soglia_combo)
-        tipo_p = tipo_soglia_combo if soglia_p is not None else None
-        gg_p = None if gg_combo == "Nessun filtro" else gg_combo
-
-        if segno_p is None and soglia_p is None and gg_p is None:
-            st.info("Seleziona almeno un filtro per calcolare la combo.")
-        else:
-            prob_combo = calcola_combo_libera(modello['griglia'], segno=segno_p, soglia_gol=soglia_p,
-                                              tipo_soglia=tipo_p, gol_nogol=gg_p)
-            quota_equa_combo = 100.0 / prob_combo if prob_combo > 0 else 0.0
-            pezzi = [p for p in [segno_p, f"{tipo_p} {soglia_p}" if soglia_p else None, gg_p] if p]
-            st.success(f"**{' + '.join(pezzi)}** → Probabilità: **{prob_combo:.1f}%** — Quota equa minima (dal modello): **{quota_equa_combo:.2f}**")
-
-            if not is_coppa:
-                q_stimata_libera, non_prezzate = stima_quota_combo_approssimata(segno_p, soglia_p, tipo_p, quote, quote_ou_25)
-                if q_stimata_libera:
-                    nota_non_prezzate = f" (esclude: {', '.join(non_prezzate)})" if non_prezzate else ""
-                    st.caption(f"💡 Quota di MERCATO stimata (approssimata, 1X2 × O/U come indipendenti): "
-                               f"~{q_stimata_libera:.2f}{nota_non_prezzate} — non è un dato reale del "
-                               f"bookmaker, solo un'approssimazione.")
-                else:
-                    st.caption("💡 Nessuna componente di questa combo ha una quota di mercato disponibile "
-                              "nel file — impossibile stimare una quota approssimata.")
 
         st.divider()
         st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
