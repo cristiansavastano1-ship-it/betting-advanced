@@ -172,6 +172,38 @@ def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
     return pd.DataFrame()
 
 
+# =====================================================================
+# 🔧 FIX CRITICO #12 — ATTRIBUZIONE CORRETTA DI GOL/TIRI/CORNER
+# BUG PRECEDENTE: le partite di una squadra venivano raccolte sia in casa
+# sia in trasferta, ma poi il codice leggeva sempre la colonna "di casa"
+# (FTHG) come "gol fatti". Per le partite giocate in TRASFERTA, FTHG sono
+# i gol dell'AVVERSARIO — quindi circa metà dei dati di attacco erano in
+# realtà dati di difesa e viceversa. Effetto: una squadra che segna 3 e
+# subisce 0 risultava 1.5/1.5, cioè perfettamente nella media — il modello
+# perdeva quasi del tutto la capacità di distinguere squadre forti e deboli,
+# e finiva sotto la semplice baseline "vince sempre la squadra di casa".
+# Qui i valori vengono attribuiti guardando, partita per partita, se la
+# squadra giocava in casa o fuori.
+# =====================================================================
+def serie_squadra(df, squadra, tipo):
+    """tipo: 'gol_fatti', 'gol_subiti', 'tiri_fatti', 'corner_fatti'.
+    Ritorna una Series con i valori attribuiti correttamente alla squadra,
+    indipendentemente dal fatto che giocasse in casa o in trasferta."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    colonne_casa = {'gol_fatti': 'FTHG', 'gol_subiti': 'FTAG', 'tiri_fatti': 'HST', 'corner_fatti': 'HC'}
+    colonne_trasf = {'gol_fatti': 'FTAG', 'gol_subiti': 'FTHG', 'tiri_fatti': 'AST', 'corner_fatti': 'AC'}
+    col_c, col_t = colonne_casa[tipo], colonne_trasf[tipo]
+
+    if col_c not in df.columns or col_t not in df.columns:
+        return pd.Series(dtype=float)
+
+    gioca_in_casa = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+    valori = df[col_c].where(gioca_in_casa, df[col_t])
+    return valori.dropna()
+
+
 def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
     frames_tot = []
     if df_coppa is not None and not df_coppa.empty:
@@ -232,15 +264,17 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
     n_casa, n_trasf = len(forma_casa), len(forma_trasf)
 
-    gf_casa_rec = media_ewma(forma_casa['FTHG'], ewma_span) if n_casa else None
-    gs_casa_rec = media_ewma(forma_casa['FTAG'], ewma_span) if n_casa else None
-    gf_trasf_rec = media_ewma(forma_trasf['FTAG'], ewma_span) if n_trasf else None
-    gs_trasf_rec = media_ewma(forma_trasf['FTHG'], ewma_span) if n_trasf else None
+    # FIX CRITICO #12 — i valori vengono attribuiti alla squadra giusta
+    # guardando, partita per partita, se giocava in casa o in trasferta.
+    gf_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_fatti'), ewma_span) if n_casa else None
+    gs_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_subiti'), ewma_span) if n_casa else None
+    gf_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_fatti'), ewma_span) if n_trasf else None
+    gs_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_subiti'), ewma_span) if n_trasf else None
 
-    tiri_casa = media_ewma(forma_casa['HST'], ewma_span) if (n_casa and 'HST' in forma_casa.columns) else None
-    corner_casa = media_ewma(forma_casa['HC'], ewma_span) if (n_casa and 'HC' in forma_casa.columns) else None
-    tiri_trasf = media_ewma(forma_trasf['AST'], ewma_span) if (n_trasf and 'AST' in forma_trasf.columns) else None
-    corner_trasf = media_ewma(forma_trasf['AC'], ewma_span) if (n_trasf and 'AC' in forma_trasf.columns) else None
+    tiri_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'tiri_fatti'), ewma_span) if n_casa else None
+    corner_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'corner_fatti'), ewma_span) if n_casa else None
+    tiri_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'tiri_fatti'), ewma_span) if n_trasf else None
+    corner_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'corner_fatti'), ewma_span) if n_trasf else None
 
     # Shrinkage: peso -> 0 quando n_casa/n_trasf sono pochi o zero, quindi la
     # stima converge verso il rapporto neutro 1.0 (= "come la media") invece
@@ -249,20 +283,39 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     peso_casa = n_casa / (n_casa + K_SHRINKAGE)
     peso_trasf = n_trasf / (n_trasf + K_SHRINKAGE)
 
-    rapp_attacco_casa = (gf_casa_rec / max(0.1, m_gol_casa)) if gf_casa_rec is not None else 1.0
-    rapp_difesa_casa = (gs_casa_rec / max(0.1, m_gol_trasf)) if gs_casa_rec is not None else 1.0
-    rapp_attacco_trasf = (gf_trasf_rec / max(0.1, m_gol_trasf)) if gf_trasf_rec is not None else 1.0
-    rapp_difesa_trasf = (gs_trasf_rec / max(0.1, m_gol_casa)) if gs_trasf_rec is not None else 1.0
+    # FIX CRITICO #13 — riferimento corretto per i rapporti attacco/difesa.
+    # I dati di una squadra mescolano partite in casa e in trasferta, quindi
+    # vanno confrontati con la media di lega COMPLESSIVA (casa+trasferta), non
+    # con quella specifica di casa o di trasferta. Prima si confrontava il dato
+    # misto della squadra di casa con la media "solo casa" (più alta) e quello
+    # della squadra ospite con la media "solo trasferta" (più bassa): risultato,
+    # le squadre di casa risultavano sistematicamente sottovalutate e le ospiti
+    # sopravvalutate — per questo il modello prevedeva più vittorie in trasferta
+    # che in casa, il contrario di come funziona davvero il calcio.
+    # Il vantaggio del fattore campo resta comunque applicato, più sotto, dal
+    # fatto che lambda_casa usa m_gol_casa e lambda_trasferta usa m_gol_trasf.
+    m_gol_complessiva = (m_gol_casa + m_gol_trasf) / 2.0
+
+    rapp_attacco_casa = (gf_casa_rec / max(0.1, m_gol_complessiva)) if gf_casa_rec is not None else 1.0
+    rapp_difesa_casa = (gs_casa_rec / max(0.1, m_gol_complessiva)) if gs_casa_rec is not None else 1.0
+    rapp_attacco_trasf = (gf_trasf_rec / max(0.1, m_gol_complessiva)) if gf_trasf_rec is not None else 1.0
+    rapp_difesa_trasf = (gs_trasf_rec / max(0.1, m_gol_complessiva)) if gs_trasf_rec is not None else 1.0
 
     attacco_casa = peso_casa * rapp_attacco_casa + (1 - peso_casa) * 1.0
     difesa_casa = peso_casa * rapp_difesa_casa + (1 - peso_casa) * 1.0
     attacco_trasf = peso_trasf * rapp_attacco_trasf + (1 - peso_trasf) * 1.0
     difesa_trasf = peso_trasf * rapp_difesa_trasf + (1 - peso_trasf) * 1.0
 
-    tiri_casa_finale = peso_casa * tiri_casa + (1 - peso_casa) * m_tiri_casa_lega if tiri_casa is not None else m_tiri_casa_lega
-    corner_casa_finale = peso_casa * corner_casa + (1 - peso_casa) * m_corner_casa_lega if corner_casa is not None else m_corner_casa_lega
-    tiri_trasf_finale = peso_trasf * tiri_trasf + (1 - peso_trasf) * m_tiri_trasf_lega if tiri_trasf is not None else m_tiri_trasf_lega
-    corner_trasf_finale = peso_trasf * corner_trasf + (1 - peso_trasf) * m_corner_trasf_lega if corner_trasf is not None else m_corner_trasf_lega
+    # Stessa logica del FIX #13 anche per tiri e angoli: i dati della squadra
+    # sono misti casa+trasferta, quindi il riferimento verso cui convergono
+    # (shrinkage) dev'essere la media complessiva, non quella specifica.
+    m_tiri_complessiva = (m_tiri_casa_lega + m_tiri_trasf_lega) / 2.0
+    m_corner_complessiva = (m_corner_casa_lega + m_corner_trasf_lega) / 2.0
+
+    tiri_casa_finale = peso_casa * tiri_casa + (1 - peso_casa) * m_tiri_complessiva if tiri_casa is not None else m_tiri_casa_lega
+    corner_casa_finale = peso_casa * corner_casa + (1 - peso_casa) * m_corner_complessiva if corner_casa is not None else m_corner_casa_lega
+    tiri_trasf_finale = peso_trasf * tiri_trasf + (1 - peso_trasf) * m_tiri_complessiva if tiri_trasf is not None else m_tiri_trasf_lega
+    corner_trasf_finale = peso_trasf * corner_trasf + (1 - peso_trasf) * m_corner_complessiva if corner_trasf is not None else m_corner_trasf_lega
 
     lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
     lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
