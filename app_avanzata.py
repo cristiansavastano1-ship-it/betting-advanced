@@ -681,6 +681,62 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
 
 
 # =====================================================================
+# 🔧 BACKTEST COMBO — stessa logica del backtest 1X2 senza filtro, applicata
+# alla combo automatica più probabile di ogni partita (tra le 12 possibili).
+# Usa la calibrazione per-combo se disponibile e attiva, e la stessa verità
+# (risultato reale) già usata per allenarle — nessuna fonte dati nuova.
+# =====================================================================
+def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None, usa_calibrazione=False):
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    ha_stagione = 'Stagione' in tutte.columns
+
+    if usa_oos and ha_stagione:
+        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+    else:
+        indici = list(range(15, len(tutte)))
+
+    if not indici:
+        return None
+
+    n_partite, n_corrette = 0, 0
+    per_combo = {f"{s}_{g}_{t}": {"previste": 0, "corrette": 0} for (s, g, t) in LE_12_COMBO}
+
+    for i in indici:
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+
+        probabilita_combo = {}
+        for (s, g, t) in LE_12_COMBO:
+            nome_chiave = f"{s}_{g}_{t}"
+            prob_grezza = calcola_combo_libera(m['griglia'], segno=s, soglia_gol=2.5, tipo_soglia=t, gol_nogol=g)
+            prob_finale = prob_grezza
+            if usa_calibrazione and id_fd:
+                calib_c = carica_calibratore(id_fd, nome_chiave)
+                if calib_c:
+                    prob_finale = float(calib_c["calibratore"].predict([prob_grezza/100])[0]) * 100
+            probabilita_combo[nome_chiave] = prob_finale
+
+        combo_prevista = max(probabilita_combo, key=probabilita_combo.get)
+        s_p, g_p, t_p = combo_prevista.split("_")
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        tot_gol_reale = partita['FTHG'] + partita['FTAG']
+        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
+        avverata = (s_p == esito) and ((g_p == "Goal") == entrambe_reale) and ((t_p == "Over") == (tot_gol_reale > 2.5))
+
+        n_partite += 1
+        per_combo[combo_prevista]["previste"] += 1
+        if avverata:
+            n_corrette += 1
+            per_combo[combo_prevista]["corrette"] += 1
+
+    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_combo": per_combo}
+
+
+# =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
@@ -783,6 +839,59 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                        "è statisticamente l'esito più difficile da prevedere, per qualunque modello. "
                        "Un'accuratezza intorno al 45-55% su 1X2 è nella norma per modelli di questo tipo — "
                        "il mercato stesso, con molte più informazioni, non fa enormemente meglio.")
+
+        st.divider()
+        st.write("**🔥 Backtest COMBO — accuratezza della combo più probabile**")
+        st.caption("Stessa logica del backtest 1X2, applicata alla combo automatica con probabilità "
+                   "più alta tra le 12 possibili (usa la calibrazione per-combo se allenata e attiva). "
+                   "Più difficile del semplice 1X2 per costruzione: una combo richiede che TRE "
+                   "condizioni si avverino insieme, non una sola.")
+
+        col_cb_a, col_cb_b = st.columns(2)
+        with col_cb_a:
+            cliccato_combo_corrente = st.button("🎯 Backtest combo — solo stagione corrente")
+        with col_cb_b:
+            cliccato_combo_tutto = st.button("📚 Backtest combo — tutto lo storico")
+
+        def mostra_risultato_backtest_combo(risultato, etichetta):
+            if risultato is None:
+                st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
+                return
+            if risultato["n_partite"] == 0:
+                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile.")
+                return
+            win_rate_combo = risultato["n_corrette"] / risultato["n_partite"] * 100
+            st.write(f"**{etichetta}**")
+            c1, c2 = st.columns(2)
+            c1.metric("Partite valutate", risultato["n_partite"])
+            c2.metric("Accuratezza combo", f"{win_rate_combo:.1f}%")
+            righe_combo_bt = []
+            for chiave, d in sorted(risultato["per_combo"].items(), key=lambda x: x[1]["previste"], reverse=True):
+                if d["previste"] == 0: continue
+                wr_c = d["corrette"]/d["previste"]*100
+                righe_combo_bt.append({
+                    "Combo prevista": chiave.replace("_", " "), "Volte prevista": d["previste"],
+                    "Corrette": d["corrette"], "Accuratezza": f"{wr_c:.1f}%",
+                })
+            if righe_combo_bt:
+                st.table(pd.DataFrame(righe_combo_bt))
+
+        if cliccato_combo_corrente:
+            with st.spinner("Backtest combo su stagione corrente..."):
+                ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
+                                              True, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+            mostra_risultato_backtest_combo(ris_c, "Solo stagione corrente (out-of-sample)")
+
+        if cliccato_combo_tutto:
+            with st.spinner("Backtest combo su tutto lo storico (può richiedere più tempo)..."):
+                ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
+                                              False, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+            mostra_risultato_backtest_combo(ris_c, "Tutto lo storico disponibile")
+
+        if cliccato_combo_corrente or cliccato_combo_tutto:
+            st.caption("Confronta questa accuratezza con quella 1X2 qui sopra: se è molto più bassa, "
+                       "è normale (tre condizioni insieme sono più difficili), non necessariamente "
+                       "un problema — ma dà la misura reale di quanto ci si può fidare delle combo.")
 
 
         st.divider()
