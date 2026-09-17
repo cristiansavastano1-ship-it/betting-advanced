@@ -534,7 +534,13 @@ def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, qu
 # nessun filtro — la metrica più diretta e senza sorprese sulla bontà di base
 # del modello, utile per mandarmi i numeri e controllarli insieme.
 # =====================================================================
-def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None, usa_calibrazione=False):
+def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
+                                  usa_calibrazione=False, richiedi_accordo_mercato=False):
+    """richiedi_accordo_mercato (IDEA #1): valuta la previsione principale SOLO
+    sulle partite dove il modello è d'accordo col favorito del mercato (stesso
+    segno con la quota più bassa) — un filtro di fiducia, non una correzione
+    della stima come il blending già scartato. Riduce il campione ma, se
+    l'idea è valida, dovrebbe alzare l'accuratezza sul sottoinsieme rimasto."""
     tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
     ha_stagione = 'Stagione' in tutte.columns
 
@@ -548,8 +554,10 @@ def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos
 
     calib_info = carica_calibratore(id_fd, "1x2") if (usa_calibrazione and id_fd) else None
     calibratore = calib_info["calibratore"] if calib_info else None
+    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
 
     n_partite, n_corrette = 0, 0
+    n_scartate_disaccordo, n_scartate_no_quote = 0, 0
     per_segno = {"1": {"previste": 0, "corrette": 0}, "X": {"previste": 0, "corrette": 0}, "2": {"previste": 0, "corrette": 0}}
 
     for i in indici:
@@ -561,17 +569,29 @@ def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos
         if calibratore is not None:
             m = applica_calibrazione_1x2(m, calibratore)
 
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
         probabilita = {"1": m['prob_1'], "X": m['prob_X'], "2": m['prob_2']}
         previsione_principale = max(probabilita, key=probabilita.get)
 
+        if richiedi_accordo_mercato:
+            quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
+            if quote is None:
+                n_scartate_no_quote += 1
+                continue
+            quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
+            favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)  # quota più bassa = favorito
+            if previsione_principale != favorito_mercato:
+                n_scartate_disaccordo += 1
+                continue
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
         n_partite += 1
         per_segno[previsione_principale]["previste"] += 1
         if previsione_principale == esito:
             n_corrette += 1
             per_segno[previsione_principale]["corrette"] += 1
 
-    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_segno": per_segno}
+    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_segno": per_segno,
+            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_no_quote": n_scartate_no_quote}
 
 
 # =====================================================================
@@ -794,6 +814,13 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                    "nessun filtro. Confronta stagione corrente e storico completo per vedere "
                    "se il modello regge o se il risultato dipende dal periodo.")
 
+        richiedi_accordo = st.checkbox(
+            "💡 Idea #1: valuta solo quando modello e mercato sono d'accordo sul favorito",
+            value=False,
+            help="Filtro di fiducia, non una correzione della stima: scarta le partite dove il "
+                 "modello si discosta dal favorito del mercato. Riduce il campione."
+        )
+
         col_bt_a, col_bt_b = st.columns(2)
         with col_bt_a:
             cliccato_corrente = st.button("🎯 Backtest — solo stagione corrente")
@@ -805,13 +832,16 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
                 return
             if risultato["n_partite"] == 0:
-                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile.")
+                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile (o tutte scartate dal filtro).")
                 return
             win_rate_tot = risultato["n_corrette"] / risultato["n_partite"] * 100
             st.write(f"**{etichetta}**")
             c1, c2 = st.columns(2)
             c1.metric("Partite valutate", risultato["n_partite"])
             c2.metric("Accuratezza", f"{win_rate_tot:.1f}%")
+            if risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_no_quote", 0) > 0:
+                st.caption(f"Scartate per disaccordo modello/mercato: {risultato['n_scartate_disaccordo']} — "
+                          f"scartate per quote mancanti: {risultato['n_scartate_no_quote']}.")
             righe_segno = []
             for s, d in risultato["per_segno"].items():
                 wr_s = (d["corrette"]/d["previste"]*100) if d["previste"] > 0 else None
@@ -825,13 +855,15 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
         if cliccato_corrente:
             with st.spinner("Backtest su stagione corrente..."):
                 ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
-                                                    True, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+                                                    True, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
+                                                    richiedi_accordo_mercato=richiedi_accordo)
             mostra_risultato_backtest(ris, "Solo stagione corrente (out-of-sample)")
 
         if cliccato_tutto:
             with st.spinner("Backtest su tutto lo storico (può richiedere più tempo)..."):
                 ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
-                                                    False, id_fd=id_fd, usa_calibrazione=usa_calibrazione)
+                                                    False, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
+                                                    richiedi_accordo_mercato=richiedi_accordo)
             mostra_risultato_backtest(ris, "Tutto lo storico disponibile")
 
         if cliccato_corrente or cliccato_tutto:
