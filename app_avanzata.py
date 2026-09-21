@@ -707,9 +707,15 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
 # (risultato reale) già usata per allenarle — nessuna fonte dati nuova.
 # =====================================================================
 def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
-                           usa_calibrazione=False, richiedi_accordo_mercato=False):
-    """richiedi_accordo_mercato: come per il backtest 1X2 — valuta solo le
-    combo il cui segno è d'accordo col favorito del mercato."""
+                           usa_calibrazione=False, richiedi_accordo_mercato=False, richiedi_accordo_ou=False):
+    """richiedi_accordo_mercato: valuta solo le combo il cui SEGNO è d'accordo
+    col favorito del mercato (idea #1, già validata su 1X2: +5/+10 punti).
+    richiedi_accordo_ou (idea #1b, DA VERIFICARE): in aggiunta, richiede che
+    anche la componente OVER/UNDER sia d'accordo con la quota di mercato
+    Over/Under 2.5 — copre una seconda delle tre dimensioni di una combo
+    (il filtro sul solo segno ne copre una su tre, la terza — Gol/No Gol —
+    resta comunque non filtrabile: non esiste una quota di mercato gratuita
+    per quel mercato nei file che usiamo)."""
     tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
     ha_stagione = 'Stagione' in tutte.columns
 
@@ -722,8 +728,9 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
         return None
 
     colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
+    colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, "2.5")
     n_partite, n_corrette = 0, 0
-    n_scartate_disaccordo, n_scartate_no_quote = 0, 0
+    n_scartate_disaccordo, n_scartate_disaccordo_ou, n_scartate_no_quote = 0, 0, 0
     per_combo = {f"{s}_{g}_{t}": {"previste": 0, "corrette": 0} for (s, g, t) in LE_12_COMBO}
 
     for i in indici:
@@ -747,15 +754,27 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
         combo_prevista = max(probabilita_combo, key=probabilita_combo.get)
         s_p, g_p, t_p = combo_prevista.split("_")
 
-        if richiedi_accordo_mercato:
+        if richiedi_accordo_mercato or richiedi_accordo_ou:
             quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
             if quote is None:
                 n_scartate_no_quote += 1
                 continue
+
+        if richiedi_accordo_mercato:
             quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
             favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)
             if s_p != favorito_mercato:
                 n_scartate_disaccordo += 1
+                continue
+
+        if richiedi_accordo_ou:
+            quote_ou = quote_over_under_normalizzate(partita, colonne_over, colonne_under)
+            if quote_ou is None:
+                n_scartate_no_quote += 1
+                continue
+            favorito_ou_mercato = "Over" if quote_ou["q_over_equa"] < quote_ou["q_under_equa"] else "Under"
+            if t_p != favorito_ou_mercato:
+                n_scartate_disaccordo_ou += 1
                 continue
 
         esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
@@ -770,7 +789,8 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
             per_combo[combo_prevista]["corrette"] += 1
 
     return {"n_partite": n_partite, "n_corrette": n_corrette, "per_combo": per_combo,
-            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_no_quote": n_scartate_no_quote}
+            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_disaccordo_ou": n_scartate_disaccordo_ou,
+            "n_scartate_no_quote": n_scartate_no_quote}
 
 
 # =====================================================================
@@ -895,6 +915,13 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                    "più alta tra le 12 possibili (usa la calibrazione per-combo se allenata e attiva). "
                    "Più difficile del semplice 1X2 per costruzione: una combo richiede che TRE "
                    "condizioni si avverino insieme, non una sola.")
+        st.caption("Il checkbox 'Idea #1' qui sopra filtra solo sul segno. Quello qui sotto (idea #1b, "
+                   "da verificare) filtra ANCHE sull'Over/Under — copre 2 delle 3 dimensioni di una combo "
+                   "invece di 1 sola. Prova le combinazioni: nessuno dei due, solo #1, solo #1b, entrambi.")
+        richiedi_accordo_ou = st.checkbox(
+            "💡 Idea #1b: richiedi accordo anche su Over/Under 2.5 col mercato",
+            value=False,
+        )
 
         col_cb_a, col_cb_b = st.columns(2)
         with col_cb_a:
@@ -907,16 +934,18 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
                 return
             if risultato["n_partite"] == 0:
-                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile.")
+                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile (o tutte scartate dai filtri).")
                 return
             win_rate_combo = risultato["n_corrette"] / risultato["n_partite"] * 100
             st.write(f"**{etichetta}**")
             c1, c2 = st.columns(2)
             c1.metric("Partite valutate", risultato["n_partite"])
             c2.metric("Accuratezza combo", f"{win_rate_combo:.1f}%")
-            if risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_no_quote", 0) > 0:
-                st.caption(f"Scartate per disaccordo modello/mercato: {risultato['n_scartate_disaccordo']} — "
-                          f"scartate per quote mancanti: {risultato['n_scartate_no_quote']}.")
+            if (risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_disaccordo_ou", 0) > 0
+                    or risultato.get("n_scartate_no_quote", 0) > 0):
+                st.caption(f"Scartate per disaccordo sul segno: {risultato.get('n_scartate_disaccordo', 0)} — "
+                          f"scartate per disaccordo su Over/Under: {risultato.get('n_scartate_disaccordo_ou', 0)} — "
+                          f"scartate per quote mancanti: {risultato.get('n_scartate_no_quote', 0)}.")
             righe_combo_bt = []
             for chiave, d in sorted(risultato["per_combo"].items(), key=lambda x: x[1]["previste"], reverse=True):
                 if d["previste"] == 0: continue
@@ -932,14 +961,16 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
             with st.spinner("Backtest combo su stagione corrente..."):
                 ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
                                               True, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                              richiedi_accordo_mercato=richiedi_accordo)
+                                              richiedi_accordo_mercato=richiedi_accordo,
+                                              richiedi_accordo_ou=richiedi_accordo_ou)
             mostra_risultato_backtest_combo(ris_c, "Solo stagione corrente (out-of-sample)")
 
         if cliccato_combo_tutto:
             with st.spinner("Backtest combo su tutto lo storico (può richiedere più tempo)..."):
                 ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
                                               False, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                              richiedi_accordo_mercato=richiedi_accordo)
+                                              richiedi_accordo_mercato=richiedi_accordo,
+                                              richiedi_accordo_ou=richiedi_accordo_ou)
             mostra_risultato_backtest_combo(ris_c, "Tutto lo storico disponibile")
 
         if cliccato_combo_corrente or cliccato_combo_tutto:
