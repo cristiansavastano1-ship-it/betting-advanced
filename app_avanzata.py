@@ -1166,11 +1166,12 @@ else:
         if not is_coppa:
             # =====================================================================
             # ✅ INDICATORE DI CONCORDANZA MODELLO/MERCATO — come scegliere le partite
-            # Il backtest ha confermato (idea #1): quando la previsione principale del
-            # modello coincide col favorito del mercato, l'accuratezza sale sensibilmente
-            # (+5/+10 punti su tutti i campionati testati). Questo badge applica lo
-            # stesso identico criterio già validato, partita per partita — è la
-            # risposta pratica a "come scelgo": preferisci le partite con ✅.
+            # Il backtest ha confermato: quando la previsione principale del modello
+            # coincide col favorito del mercato, l'accuratezza sale (idea #1: segno,
+            # +5/+10 punti; idea #1b: anche Over/Under 2.5, ulteriore miglioramento
+            # in La Liga, Bundesliga, Ligue 1 — più debole ma comunque presente su
+            # Serie A e Premier League). Due badge separati, stesso criterio già
+            # validato nel backtest, applicato partita per partita.
             # =====================================================================
             colonne_h_pre, colonne_d_pre, colonne_a_pre = classifica_colonne_quote(dati.columns)
             quote_pre = quote_mercato_normalizzate(partita_sel, colonne_h_pre, colonne_d_pre, colonne_a_pre)
@@ -1180,12 +1181,25 @@ else:
                 quote_per_segno_pre = {"1": quote_pre["q_casa_equa"], "X": quote_pre["q_x_equa"], "2": quote_pre["q_trasf_equa"]}
                 favorito_mercato_pre = min(quote_per_segno_pre, key=quote_per_segno_pre.get)
                 if previsione_modello == favorito_mercato_pre:
-                    st.success(f"✅ **Modello e mercato d'accordo** (entrambi favoriscono '{previsione_modello}') — "
+                    st.success(f"✅ **Segno — modello e mercato d'accordo** (entrambi favoriscono '{previsione_modello}') — "
                               f"nel backtest, su questo tipo di partite l'accuratezza è stata sensibilmente più alta.")
                 else:
-                    st.warning(f"⚠️ **Disaccordo**: il modello preferisce '{previsione_modello}', il mercato "
+                    st.warning(f"⚠️ **Segno — disaccordo**: il modello preferisce '{previsione_modello}', il mercato "
                               f"favorisce '{favorito_mercato_pre}' — nel backtest, questo tipo di partite ha "
                               f"un'accuratezza più bassa. Trattala con più cautela.")
+
+            colonne_over_pre, colonne_under_pre = classifica_colonne_over_under(dati.columns, "2.5")
+            quote_ou_pre = quote_over_under_normalizzate(partita_sel, colonne_over_pre, colonne_under_pre)
+            if quote_ou_pre:
+                p_under_modello = modello['prob_under'][2.5]
+                previsione_ou_modello = "Under" if p_under_modello >= 50 else "Over"
+                favorito_ou_mercato_pre = "Over" if quote_ou_pre["q_over_equa"] < quote_ou_pre["q_under_equa"] else "Under"
+                if previsione_ou_modello == favorito_ou_mercato_pre:
+                    st.success(f"✅ **Over/Under 2.5 — modello e mercato d'accordo** (entrambi favoriscono "
+                              f"'{previsione_ou_modello}') — segnale aggiuntivo utile soprattutto per le combo.")
+                else:
+                    st.warning(f"⚠️ **Over/Under 2.5 — disaccordo**: il modello preferisce '{previsione_ou_modello}', "
+                              f"il mercato favorisce '{favorito_ou_mercato_pre}'.")
 
         if not is_coppa:
             st.markdown("### 💰 Controllo Value Bet (media multi-bookmaker, quote depurate dal margine)")
