@@ -978,6 +978,59 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                        "è normale (tre condizioni insieme sono più difficili), non necessariamente "
                        "un problema — ma dà la misura reale di quanto ci si può fidare delle combo.")
 
+        st.divider()
+        st.write("**⚡ Test completo automatico (le 8 combinazioni insieme)**")
+        st.caption("Invece di lanciare i due bottoni sopra 4 volte a mano (con/senza ciascun filtro) e "
+                   "copiare ogni tabella, questo le fa tutte in un colpo solo e ti dà un file da "
+                   "scaricare e mandarmi direttamente — niente più copia-incolla su Word.")
+
+        if st.button("⚡ Esegui tutte le 8 combinazioni per questo campionato"):
+            righe_test_completo = []
+            combinazioni = [
+                ("Solo stagione corrente", True, False, False),
+                ("Solo stagione corrente", True, True, False),
+                ("Solo stagione corrente", True, False, True),
+                ("Solo stagione corrente", True, True, True),
+                ("Tutto lo storico", False, False, False),
+                ("Tutto lo storico", False, True, False),
+                ("Tutto lo storico", False, False, True),
+                ("Tutto lo storico", False, True, True),
+            ]
+            barra_avanzamento = st.progress(0.0, text="Avvio...")
+            for idx, (etichetta_periodo, oos, filtro_segno, filtro_ou) in enumerate(combinazioni):
+                barra_avanzamento.progress((idx)/8, text=f"{idx+1}/8 — {etichetta_periodo}, "
+                                           f"segno={'sì' if filtro_segno else 'no'}, O/U={'sì' if filtro_ou else 'no'}...")
+                ris = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val, oos, id_fd=id_fd,
+                                            usa_calibrazione=usa_calibrazione,
+                                            richiedi_accordo_mercato=filtro_segno, richiedi_accordo_ou=filtro_ou)
+                if ris is None or ris["n_partite"] == 0:
+                    righe_test_completo.append({
+                        "Campionato": campionato, "Periodo": etichetta_periodo,
+                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
+                        "Partite valutate": 0, "Corrette": 0, "Accuratezza %": None,
+                    })
+                else:
+                    righe_test_completo.append({
+                        "Campionato": campionato, "Periodo": etichetta_periodo,
+                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
+                        "Partite valutate": ris["n_partite"], "Corrette": ris["n_corrette"],
+                        "Accuratezza %": round(ris["n_corrette"]/ris["n_partite"]*100, 1),
+                    })
+            barra_avanzamento.progress(1.0, text="Completato!")
+
+            df_test_completo = pd.DataFrame(righe_test_completo)
+            st.dataframe(df_test_completo, use_container_width=True, hide_index=True)
+
+            csv_bytes = df_test_completo.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Scarica questi risultati come CSV",
+                data=csv_bytes,
+                file_name=f"backtest_combo_{id_fd}.csv",
+                mime="text/csv",
+            )
+            st.caption("Scarica il CSV per ogni campionato che testi, poi mandameli tutti insieme — "
+                       "posso leggerli direttamente, non serve più copiarli su Word.")
+
 
         st.divider()
         st.write("**🎯 Calibrazione (1X2 + le 12 combo automatiche)**")
