@@ -817,9 +817,103 @@ with st.sidebar:
         help="Corregge le probabilità sulla base della verifica storica. Disattiva per confrontare prima/dopo."
     )
 
-scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
+scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)", "📅 Schedina del giorno (multi-campionato)"], horizontal=True)
 
-if scelta_categoria == "Campionati Nazionali (Gratuiti)":
+if scelta_categoria == "📅 Schedina del giorno (multi-campionato)":
+    # =====================================================================
+    # 📅 SCHEDINA DEL GIORNO — le migliori occasioni su tutti i campionati
+    # domestici insieme, per una data specifica. Filtro obbligatorio: accordo
+    # modello/mercato sul segno (idea #1, validata: +5/+10 punti in tutti i
+    # campionati testati). L'accordo su Over/Under (idea #1b) è un BONUS
+    # nell'ordinamento, non un'esclusione — su Serie A/Premier aiuta poco,
+    # escluderlo del tutto avrebbe buttato via occasioni buone lì.
+    # Solo la giornata scelta: nessun riempimento con giorni successivi se
+    # ne trova meno di 5 — mostra quello che c'è davvero quel giorno.
+    # =====================================================================
+    st.markdown("## 📅 Schedina del giorno")
+    st.caption("Le migliori occasioni su tutti i campionati domestici insieme, per una data specifica. "
+               "Filtro: accordo modello/mercato sul segno (obbligatorio). L'accordo anche su Over/Under "
+               "fa salire in classifica, ma non esclude — su alcuni campionati aiuta poco.")
+
+    data_scelta = st.date_input("Data delle partite", value=date.today())
+
+    if st.button("📅 Trova le migliori occasioni di questo giorno"):
+        candidate = []
+        avvisi_leghe = []
+
+        with st.spinner("Scarico e analizzo tutti i campionati (può richiedere qualche secondo)..."):
+            for nome_campionato, info_lega in CAMPIONATI_DOMESTICI.items():
+                id_fd_lega = info_lega["id_fd"]
+                dati_lega = carica_dati_campionato(id_fd_lega)
+                fixture_lega = carica_fixture_future(id_fd_lega)
+
+                if dati_lega is None:
+                    avvisi_leghe.append(f"{nome_campionato}: dati storici non disponibili in questo momento.")
+                    continue
+                if fixture_lega.empty:
+                    continue
+
+                partite_del_giorno = fixture_lega[fixture_lega['Date_parsed'].dt.date == data_scelta]
+                if partite_del_giorno.empty:
+                    continue
+
+                colonne_h_s, colonne_d_s, colonne_a_s = classifica_colonne_quote(dati_lega.columns)
+                colonne_over_s, colonne_under_s = classifica_colonne_over_under(dati_lega.columns, "2.5")
+                calib_1x2_lega = carica_calibratore(id_fd_lega, "1x2") if usa_calibrazione else None
+
+                for _, partita_g in partite_del_giorno.iterrows():
+                    m_g = calcola_modello_completo(dati_lega, partita_g['HomeTeam'], partita_g['AwayTeam'],
+                                                    rho_val, ewma_span_val, emivita_val, pd.DataFrame(),
+                                                    data_riferimento=partita_g.get('Date_parsed'))
+                    if calib_1x2_lega:
+                        m_g = applica_calibrazione_1x2(m_g, calib_1x2_lega["calibratore"])
+
+                    quote_g = quote_mercato_normalizzate(partita_g, colonne_h_s, colonne_d_s, colonne_a_s)
+                    if quote_g is None:
+                        continue  # senza quote non possiamo verificare l'accordo, scartiamo
+
+                    probabilita_g = {"1": m_g['prob_1'], "X": m_g['prob_X'], "2": m_g['prob_2']}
+                    previsione_g = max(probabilita_g, key=probabilita_g.get)
+                    quote_per_segno_g = {"1": quote_g["q_casa_equa"], "X": quote_g["q_x_equa"], "2": quote_g["q_trasf_equa"]}
+                    favorito_mercato_g = min(quote_per_segno_g, key=quote_per_segno_g.get)
+
+                    if previsione_g != favorito_mercato_g:
+                        continue  # filtro obbligatorio: niente accordo sul segno, fuori
+
+                    accordo_ou_g = False
+                    quote_ou_g = quote_over_under_normalizzate(partita_g, colonne_over_s, colonne_under_s)
+                    if quote_ou_g:
+                        prev_ou_g = "Under" if m_g['prob_under'][2.5] >= 50 else "Over"
+                        favorito_ou_g = "Over" if quote_ou_g["q_over_equa"] < quote_ou_g["q_under_equa"] else "Under"
+                        accordo_ou_g = (prev_ou_g == favorito_ou_g)
+
+                    punteggio_g = probabilita_g[previsione_g] + (5 if accordo_ou_g else 0)
+                    candidate.append({
+                        "Campionato": nome_campionato, "Partita": f"{partita_g['HomeTeam']} vs {partita_g['AwayTeam']}",
+                        "Segno consigliato": previsione_g, "Probabilità": probabilita_g[previsione_g],
+                        "Quota mercato": quote_per_segno_g[previsione_g],
+                        "Accordo O/U": "✅" if accordo_ou_g else "—", "_punteggio": punteggio_g,
+                    })
+
+        if avvisi_leghe:
+            for a in avvisi_leghe:
+                st.caption(f"⚠️ {a}")
+
+        if not candidate:
+            st.warning(f"Nessuna partita con accordo modello/mercato trovata per il {data_scelta.strftime('%d/%m/%Y')}. "
+                      "Prova un'altra data, o verifica che le fixture siano già pubblicate per quel giorno.")
+        else:
+            candidate.sort(key=lambda x: x["_punteggio"], reverse=True)
+            top5 = candidate[:5]
+            st.success(f"Trovate {len(candidate)} partite con accordo sul segno — mostro le migliori {len(top5)}.")
+            df_schedina = pd.DataFrame(top5).drop(columns=["_punteggio"])
+            df_schedina["Probabilità"] = df_schedina["Probabilità"].map(lambda x: f"{x:.1f}%")
+            df_schedina["Quota mercato"] = df_schedina["Quota mercato"].map(lambda x: f"{x:.2f}")
+            st.dataframe(df_schedina, use_container_width=True, hide_index=True)
+            st.caption("Ordinate per probabilità del segno (+ bonus se c'è accordo anche su Over/Under). "
+                      "Tutte hanno già superato il filtro obbligatorio sul segno.")
+
+elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
     campionato = st.selectbox("Seleziona Campionato", list(CAMPIONATI_DOMESTICI.keys()))
     info = CAMPIONATI_DOMESTICI[campionato]
     id_fd = info["id_fd"]
