@@ -913,6 +913,9 @@ if scelta_categoria == "📅 Schedina del giorno (multi-campionato)":
             st.caption("Ordinate per probabilità del segno (+ bonus se c'è accordo anche su Over/Under). "
                       "Tutte hanno già superato il filtro obbligatorio sul segno.")
 
+    st.stop()  # FIX — senza questo, l'esecuzione proseguiva nel codice sotto
+               # (pensato per gli altri due rami) usando variabili mai definite qui.
+
 elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
     campionato = st.selectbox("Seleziona Campionato", list(CAMPIONATI_DOMESTICI.keys()))
     info = CAMPIONATI_DOMESTICI[campionato]
