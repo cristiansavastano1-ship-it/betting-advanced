@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -850,10 +851,16 @@ if scelta_categoria == "📅 Schedina del giorno (multi-campionato)":
                 if dati_lega is None:
                     avvisi_leghe.append(f"{nome_campionato}: dati storici non disponibili in questo momento.")
                     continue
-                if fixture_lega.empty:
-                    continue
 
-                partite_del_giorno = fixture_lega[fixture_lega['Date_parsed'].dt.date == data_scelta]
+                # FIX — ricerca retroattiva: fixtures.csv contiene SOLO partite
+                # non ancora giocate (una volta giocate spariscono da lì). Se la
+                # data è nel passato, o non è tra le fixture future, cerchiamo
+                # nello storico già scaricato — stessa logica, fonte diversa.
+                partite_del_giorno = pd.DataFrame()
+                if not fixture_lega.empty:
+                    partite_del_giorno = fixture_lega[fixture_lega['Date_parsed'].dt.date == data_scelta]
+                if partite_del_giorno.empty and 'Date_parsed' in dati_lega.columns:
+                    partite_del_giorno = dati_lega[dati_lega['Date_parsed'].dt.date == data_scelta]
                 if partite_del_giorno.empty:
                     continue
 
@@ -862,9 +869,11 @@ if scelta_categoria == "📅 Schedina del giorno (multi-campionato)":
                 calib_1x2_lega = carica_calibratore(id_fd_lega, "1x2") if usa_calibrazione else None
 
                 for _, partita_g in partite_del_giorno.iterrows():
-                    m_g = calcola_modello_completo(dati_lega, partita_g['HomeTeam'], partita_g['AwayTeam'],
+                    data_rif_g = partita_g.get('Date_parsed')
+                    dati_prec_g = dati_lega[dati_lega['Date_parsed'] < data_rif_g] if pd.notna(data_rif_g) else dati_lega
+                    m_g = calcola_modello_completo(dati_prec_g, partita_g['HomeTeam'], partita_g['AwayTeam'],
                                                     rho_val, ewma_span_val, emivita_val, pd.DataFrame(),
-                                                    data_riferimento=partita_g.get('Date_parsed'))
+                                                    data_riferimento=data_rif_g)
                     if calib_1x2_lega:
                         m_g = applica_calibrazione_1x2(m_g, calib_1x2_lega["calibratore"])
 
