@@ -7,19 +7,25 @@ import io
 import time
 import os
 import pickle
+import re
+import unicodedata
+from functools import lru_cache
 from datetime import datetime, date
 from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 
 st.set_page_config(page_title="COMBO - Advanced Betting Model", page_icon="⚽", layout="centered")
 
+# "code_api" = codice della stessa competizione su football-data.org, usato
+# solo come fonte di RISERVA quando football-data.co.uk non risponde.
 CAMPIONATI_DOMESTICI = {
-    "Italia - Serie A": {"id_fd": "I1"},
-    "Inghilterra - Premier League": {"id_fd": "E0"},
-    "Spagna - La Liga": {"id_fd": "SP1"},
-    "Germania - Bundesliga": {"id_fd": "D1"},
-    "Francia - Ligue 1": {"id_fd": "F1"},
+    "Italia - Serie A": {"id_fd": "I1", "code_api": "SA"},
+    "Inghilterra - Premier League": {"id_fd": "E0", "code_api": "PL"},
+    "Spagna - La Liga": {"id_fd": "SP1", "code_api": "PD"},
+    "Germania - Bundesliga": {"id_fd": "D1", "code_api": "BL1"},
+    "Francia - Ligue 1": {"id_fd": "F1", "code_api": "FL1"},
 }
+CODICE_API_PER_ID_FD = {v["id_fd"]: v["code_api"] for v in CAMPIONATI_DOMESTICI.values()}
 
 CAMPIONATI_COPPE = {
     "🌍 UEFA Champions League": {"code": "CL", "gratis_confermato": True},
@@ -34,22 +40,146 @@ K_SHRINKAGE = 10  # stesso principio già validato nell'App Risultati Fissi
 
 
 # =====================================================================
-# 🔧 FIX #4 — MATCHING SQUADRE "MORBIDO"
-# Prima: confronto testuale esatto. Con le coppe europee (nomi da
-# football-data.org, es. "Manchester United FC") contro i nomi domestici
-# (es. "Man United") il match esatto falliva spesso in silenzio, facendo
-# scattare il generatore di dati finti (ora rimosso, vedi FIX #1).
+# 🔧 MATCHING SQUADRE — versione 2 (sostituisce il vecchio FIX #4)
+# Il confronto precedente ("una stringa contenuta nell'altra") falliva sui
+# club con nomi molto diversi tra le due fonti ("Manchester United FC" contro
+# "Man United", "Paris Saint-Germain FC" contro "Paris SG") e confondeva
+# club diversi ("Milan" dentro "Internazionale Milano", "Paris" dentro
+# "Paris SG"). Ora:
+#  1. i nomi vengono normalizzati (accenti, punteggiatura, sigle tipo FC/AC);
+#  2. i club più comuni stanno in una tabella di alias: due nomi corrispondono
+#     solo se puntano allo STESSO club, mai per sottostringa;
+#  3. per i nomi fuori tabella si accetta solo l'inclusione di PAROLE intere
+#     ("Newcastle" dentro "Newcastle United"), mai di pezzi di parola, e mai
+#     tra un club in tabella e uno fuori tabella.
+# Se una squadra non viene riconosciuta e non ha storico, l'app lo dice
+# (vedi avviso "nessuna partita trovata" più sotto).
+# Per aggiungere un club: una riga in ALIAS_SQUADRE, con TUTTE le grafie che
+# compaiono nelle due fonti (football-data.co.uk e football-data.org).
 # =====================================================================
-def normalizza_nome_squadra(nome):
-    nome = str(nome)
-    for suffisso in [" FC", " CF", " AFC", " AC", " SC", " CFC"]:
-        nome = nome.replace(suffisso, "")
-    return nome.strip().lower()
+_PAROLE_IGNORATE = {"fc", "cf", "afc", "ac", "acf", "sc", "cfc", "ssc", "as", "us", "ss", "rc", "rcd",
+                    "ud", "cd", "ca", "sd", "sv", "vfb", "vfl", "tsg", "fsv", "bsc", "fk", "sk", "nk",
+                    "bc", "calcio", "de", "di", "del", "the"}
+
+ALIAS_SQUADRE = {
+    # --- Inghilterra
+    "arsenal": ["Arsenal"], "aston villa": ["Aston Villa"], "bournemouth": ["Bournemouth", "AFC Bournemouth"],
+    "brentford": ["Brentford"], "brighton": ["Brighton", "Brighton & Hove Albion"], "burnley": ["Burnley"],
+    "chelsea": ["Chelsea"], "crystal palace": ["Crystal Palace"], "everton": ["Everton"], "fulham": ["Fulham"],
+    "leeds": ["Leeds", "Leeds United"], "liverpool": ["Liverpool"],
+    "man city": ["Man City", "Manchester City"],
+    "man united": ["Man United", "Man Utd", "Manchester United", "Manchester Utd"],
+    "newcastle": ["Newcastle", "Newcastle United", "Newcastle Utd"],
+    "nottm forest": ["Nott'm Forest", "Nottm Forest", "Nottingham Forest"],
+    "sunderland": ["Sunderland"], "tottenham": ["Tottenham", "Tottenham Hotspur", "Spurs"],
+    "west ham": ["West Ham", "West Ham United"], "wolves": ["Wolves", "Wolverhampton Wanderers", "Wolverhampton"],
+    "leicester": ["Leicester", "Leicester City"], "southampton": ["Southampton"],
+    "ipswich": ["Ipswich", "Ipswich Town"], "west brom": ["West Brom", "West Bromwich Albion"],
+    "sheffield united": ["Sheffield United", "Sheffield Utd", "Sheff Utd"],
+    "sheffield wednesday": ["Sheffield Weds", "Sheffield Wednesday", "Sheff Wed"],
+    "luton": ["Luton", "Luton Town"], "norwich": ["Norwich", "Norwich City"],
+    # --- Spagna
+    "alaves": ["Alaves", "Deportivo Alaves"],
+    "ath bilbao": ["Ath Bilbao", "Athletic Bilbao", "Athletic Club", "Athletic Club Bilbao"],
+    "ath madrid": ["Ath Madrid", "Atletico Madrid", "Atletico de Madrid", "Club Atletico de Madrid", "Atl Madrid"],
+    "barcelona": ["Barcelona", "FC Barcelona"], "betis": ["Betis", "Real Betis", "Real Betis Balompie"],
+    "celta": ["Celta", "Celta Vigo", "RC Celta de Vigo"], "elche": ["Elche"],
+    "espanol": ["Espanol", "Espanyol", "RCD Espanyol de Barcelona", "Espanyol Barcelona"],
+    "getafe": ["Getafe"], "girona": ["Girona"], "levante": ["Levante", "Levante UD"],
+    "mallorca": ["Mallorca", "RCD Mallorca"], "osasuna": ["Osasuna", "CA Osasuna"],
+    "oviedo": ["Oviedo", "Real Oviedo"], "real madrid": ["Real Madrid"], "sevilla": ["Sevilla"],
+    "sociedad": ["Sociedad", "Real Sociedad", "Real Sociedad de Futbol"], "valencia": ["Valencia"],
+    "vallecano": ["Vallecano", "Rayo Vallecano", "Rayo Vallecano de Madrid"], "villarreal": ["Villarreal"],
+    "las palmas": ["Las Palmas", "UD Las Palmas"], "leganes": ["Leganes", "CD Leganes"],
+    "valladolid": ["Valladolid", "Real Valladolid"],
+    # --- Italia
+    "atalanta": ["Atalanta", "Atalanta BC"], "bologna": ["Bologna", "Bologna FC 1909"],
+    "cagliari": ["Cagliari", "Cagliari Calcio"], "como": ["Como", "Como 1907"],
+    "cremonese": ["Cremonese", "US Cremonese"], "fiorentina": ["Fiorentina", "ACF Fiorentina"],
+    "genoa": ["Genoa", "Genoa CFC"],
+    "inter": ["Inter", "Internazionale", "FC Internazionale Milano", "Inter Milan"],
+    "juventus": ["Juventus", "Juventus FC"], "lazio": ["Lazio", "SS Lazio"], "lecce": ["Lecce", "US Lecce"],
+    "milan": ["Milan", "AC Milan"], "napoli": ["Napoli", "SSC Napoli"],
+    "parma": ["Parma", "Parma Calcio 1913"], "pisa": ["Pisa", "AC Pisa 1909"], "roma": ["Roma", "AS Roma"],
+    "sassuolo": ["Sassuolo", "US Sassuolo Calcio"], "torino": ["Torino", "Torino FC"],
+    "udinese": ["Udinese", "Udinese Calcio"], "verona": ["Verona", "Hellas Verona"],
+    # --- Francia
+    "angers": ["Angers", "Angers SCO"], "auxerre": ["Auxerre", "AJ Auxerre"],
+    "brest": ["Brest", "Stade Brestois", "Stade Brestois 29"], "le havre": ["Le Havre", "Le Havre AC"],
+    "lens": ["Lens", "RC Lens", "Racing Club de Lens"], "lille": ["Lille", "Lille OSC", "LOSC Lille"],
+    "lorient": ["Lorient", "FC Lorient"], "lyon": ["Lyon", "Olympique Lyonnais", "Olympique Lyon"],
+    "marseille": ["Marseille", "Olympique de Marseille", "Olympique Marseille"],
+    "metz": ["Metz", "FC Metz"], "monaco": ["Monaco", "AS Monaco", "AS Monaco FC"],
+    "nantes": ["Nantes", "FC Nantes"], "nice": ["Nice", "OGC Nice"],
+    "paris fc": ["Paris FC"],   # attenzione: diverso dal PSG ("Paris" da solo = Paris FC)
+    "paris sg": ["Paris SG", "Paris Saint-Germain", "Paris Saint Germain", "PSG"],
+    "rennes": ["Rennes", "Stade Rennais", "Stade Rennais FC 1901"],
+    "strasbourg": ["Strasbourg", "RC Strasbourg", "RC Strasbourg Alsace"],
+    "toulouse": ["Toulouse", "Toulouse FC"],
+    "st etienne": ["St Etienne", "Saint-Etienne", "AS Saint-Etienne"],
+    # --- Germania
+    "augsburg": ["Augsburg", "FC Augsburg"],
+    "bayern munich": ["Bayern Munich", "Bayern Munchen", "FC Bayern Munchen", "Bayern"],
+    "dortmund": ["Dortmund", "Borussia Dortmund"],
+    "ein frankfurt": ["Ein Frankfurt", "Eintracht Frankfurt", "Frankfurt"],
+    "freiburg": ["Freiburg", "SC Freiburg"], "hamburg": ["Hamburg", "Hamburger SV"],
+    "heidenheim": ["Heidenheim", "1. FC Heidenheim 1846"], "hoffenheim": ["Hoffenheim", "TSG 1899 Hoffenheim"],
+    "koln": ["Koln", "FC Koln", "1. FC Köln"],
+    "leverkusen": ["Leverkusen", "Bayer Leverkusen", "Bayer 04 Leverkusen"],
+    "mgladbach": ["M'gladbach", "Monchengladbach", "Borussia Mönchengladbach", "Gladbach"],
+    "mainz": ["Mainz", "Mainz 05", "1. FSV Mainz 05"], "rb leipzig": ["RB Leipzig", "Leipzig"],
+    "st pauli": ["St Pauli", "FC St. Pauli", "FC St. Pauli 1910"], "stuttgart": ["Stuttgart", "VfB Stuttgart"],
+    "union berlin": ["Union Berlin", "1. FC Union Berlin"],
+    "werder bremen": ["Werder Bremen", "SV Werder Bremen", "Bremen"],
+    "wolfsburg": ["Wolfsburg", "VfL Wolfsburg"], "bochum": ["Bochum", "VfL Bochum", "VfL Bochum 1848"],
+    "holstein kiel": ["Holstein Kiel", "KSV Holstein Kiel"], "schalke": ["Schalke 04", "FC Schalke 04"],
+    "hertha": ["Hertha", "Hertha Berlin", "Hertha BSC"], "darmstadt": ["Darmstadt", "SV Darmstadt 98"],
+}
 
 
+@lru_cache(maxsize=None)
+def _token_nome(nome):
+    """Nome -> tupla di parole normalizzate: senza accenti, minuscole, senza punteggiatura,
+    senza sigle societarie (FC, AC, SSC...) e senza numeri (anni di fondazione)."""
+    t = unicodedata.normalize("NFKD", str(nome))
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return tuple(p for p in t.split() if p and not p.isdigit() and p not in _PAROLE_IGNORATE)
+
+
+def _costruisci_alias_inverso():
+    inverso = {}
+    for canonico, varianti in ALIAS_SQUADRE.items():
+        for v in [canonico] + list(varianti):
+            chiave = _token_nome(v)
+            if chiave and chiave not in inverso:
+                inverso[chiave] = canonico
+    return inverso
+
+
+_ALIAS_INVERSO = _costruisci_alias_inverso()
+
+
+@lru_cache(maxsize=None)
+def chiave_squadra(nome):
+    """Nome canonico del club se è in tabella, altrimenti None."""
+    return _ALIAS_INVERSO.get(_token_nome(nome))
+
+
+@lru_cache(maxsize=None)
 def nomi_corrispondono(a, b):
-    na, nb = normalizza_nome_squadra(a), normalizza_nome_squadra(b)
-    return na == nb or na in nb or nb in na
+    ka, kb = chiave_squadra(a), chiave_squadra(b)
+    if ka is not None and kb is not None:
+        return ka == kb                      # entrambi noti: stesso club o niente
+    ta, tb = _token_nome(a), _token_nome(b)
+    if not ta or not tb:
+        return False
+    if ta == tb:
+        return True
+    if ka is not None or kb is not None:
+        return False                         # uno noto e uno no: solo uguaglianza esatta
+    sa, sb = set(ta), set(tb)
+    return sa <= sb or sb <= sa              # entrambi ignoti: parole intere, mai pezzi di parola
 
 
 def codici_stagione(oggi=None):
@@ -89,14 +219,67 @@ def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
 # (stessa correzione già validata nell'App Risultati Fissi, dopo il
 # disservizio di football-data.co.uk causato dal blocco geografico su
 # "www" per il traffico non-UK)
+#
+# 🔧 CATENA DI RISERVA (nuova). Ordine di tentativi per i campionati:
+#   1. football-data.co.uk online  → dati completi (quote, tiri, corner)
+#   2. ultima copia valida salvata su disco → dati completi ma datati
+#   3. football-data.org (serve la chiave API) → MODALITÀ RIDOTTA: solo
+#      risultati della stagione corrente, senza quote/tiri/corner
+# L'app dice sempre quale fonte sta usando (colonna "FonteDati").
+# Nota: su Streamlit Community Cloud il disco si azzera a ogni riavvio/
+# redeploy, quindi la copia (punto 2) può non esserci: per questo esiste
+# anche il punto 3.
 # =====================================================================
-def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
+CARTELLA_COPIE = "copie_dati_combo"   # stessa logica "best effort" dei calibratori (.pkl)
+FONTE_RIDOTTA = "football-data.org (modalità ridotta)"
+
+
+def _path_copia(url):
+    nome = re.sub(r"[^A-Za-z0-9]+", "_", url.replace("://www.", "://").split("://", 1)[-1]).strip("_")
+    return os.path.join(CARTELLA_COPIE, nome + ".csv")
+
+
+def _salva_copia(url, testo):
+    """Salva l'ultimo CSV scaricato correttamente. Mai bloccante: se il disco non
+    è scrivibile, semplicemente non ci sarà copia."""
+    try:
+        os.makedirs(CARTELLA_COPIE, exist_ok=True)
+        path = _path_copia(url)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(testo)
+        os.replace(tmp, path)   # scrittura atomica: mai una copia a metà
+    except Exception:
+        pass
+
+
+def _leggi_copia(url):
+    path = _path_copia(url)
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            testo = f.read()
+        df = pd.read_csv(io.StringIO(testo))
+        df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]
+        return df, datetime.fromtimestamp(os.path.getmtime(path))
+    except Exception:
+        return None, None
+
+
+def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2, colonne_attese=("HomeTeam", "AwayTeam")):
     """FIX #11 — BOM (Byte Order Mark): fixtures.csv inizia con un carattere
     invisibile Unicode che, se non gestito, si attacca al nome della prima
     colonna ("Div" diventa "\\ufeffDiv"), facendo fallire in silenzio ogni
     controllo tipo "if 'Div' in colonne" — nessuna fixture futura veniva mai
     trovata, su nessun campionato, per questo motivo esatto. 'utf-8-sig' lo
-    rimuove in fase di decodifica; non fa danno se il file non ha il BOM."""
+    rimuove in fase di decodifica; non fa danno se il file non ha il BOM.
+
+    Ritorna (df, errore). Se il download online riesce, df.attrs["fonte"] = "online" e
+    l'ultimo file valido viene salvato su disco. Se fallisce ma esiste una copia
+    salvata, ritorna la copia (df.attrs["fonte"] = "copia salvata il ...") e
+    l'errore online. Solo se non c'è nemmeno la copia ritorna (None, errore).
+    `colonne_attese` evita di scambiare per dati una pagina HTML d'errore."""
     varianti_url = [url]
     if "://www." in url:
         varianti_url.append(url.replace("://www.", "://"))
@@ -112,28 +295,68 @@ def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
                 testo = resp.content.decode('utf-8-sig', errors='replace')
                 df = pd.read_csv(io.StringIO(testo))
                 df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]  # rete di sicurezza extra
+                if colonne_attese and not set(colonne_attese).issubset(df.columns):
+                    raise ValueError("file scaricato non valido (colonne attese mancanti)")
+                _salva_copia(url, testo)
+                df.attrs["fonte"] = "online"
                 return df, None
             except Exception as e:
                 ultimo_errore = str(e)
         if tentativo < tentativi - 1:
             time.sleep(attesa_secondi)
+
+    copia, quando = _leggi_copia(url)
+    if copia is not None and (not colonne_attese or set(colonne_attese).issubset(copia.columns)):
+        copia.attrs["fonte"] = f"copia salvata il {quando:%d/%m/%Y %H:%M}"
+        return copia, ultimo_errore
     return None, ultimo_errore
 
 
+def _da_api_come_stagione_corrente(id_fd, api_key):
+    """Riserva football-data.org per un campionato domestico: DataFrame con lo stesso
+    schema minimo del CSV (Date, HomeTeam, AwayTeam, FTHG, FTAG) o None."""
+    codice = CODICE_API_PER_ID_FD.get(id_fd)
+    if not api_key or not codice:
+        return None
+    da_api = carica_dati_api_europee(codice, api_key)
+    if not isinstance(da_api, pd.DataFrame) or len(da_api) == 0:
+        return None
+    da_api = da_api.copy()
+    # stesso formato data del CSV (gg/mm/aaaa): se mescolassimo ISO e gg/mm/aaaa nella
+    # stessa colonna, pandas scarterebbe in silenzio le righe del formato "minoritario"
+    da_api['Date'] = da_api['Date_parsed'].dt.strftime('%d/%m/%Y')
+    return da_api
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def carica_dati_campionato(id_fd):
+def carica_dati_campionato(id_fd, api_key=None):
     """FIX B — aggiunto il tag 'Stagione' (precedente/corrente), necessario
     per poter validare il value bet SOLO sui risultati reali più recenti,
-    non su quelli già usati per calibrare le medie di lega."""
+    non su quelli già usati per calibrare le medie di lega.
+    Colonna 'FonteDati': "online", "copia salvata il ..." o FONTE_RIDOTTA."""
     codice_corrente, codice_precedente = codici_stagione()
     frames = []
+    ha_corrente = False
     for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
         url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
         df, _ = scarica_csv_robusto(url)
         if df is not None:
             df.columns = df.columns.str.strip()
             df['Stagione'] = label
+            df['FonteDati'] = df.attrs.get("fonte", "online")
             frames.append(df)
+            ha_corrente = ha_corrente or label == 'corrente'
+
+    # Riserva: manca la stagione corrente (né online né in copia) → football-data.org.
+    # Si usa solo se ha almeno una partita già giocata (a inizio stagione, prima della
+    # prima giornata, il file .co.uk può non esistere ancora: non è un guasto).
+    if not ha_corrente:
+        da_api = _da_api_come_stagione_corrente(id_fd, api_key)
+        if da_api is not None and (da_api['Status'] == 'FINISHED').any():
+            da_api['Stagione'] = 'corrente'
+            da_api['FonteDati'] = FONTE_RIDOTTA
+            frames.append(da_api)
+
     if frames:
         dati = pd.concat(frames, ignore_index=True, sort=False)
         dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
@@ -142,15 +365,40 @@ def carica_dati_campionato(id_fd):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def carica_tutti_i_campionati():
+def carica_tutti_i_campionati(api_key=None):
     tutti_dati = []
     for c_info in CAMPIONATI_DOMESTICI.values():
-        df = carica_dati_campionato(c_info["id_fd"])
+        df = carica_dati_campionato(c_info["id_fd"], api_key)
         if df is not None:
             tutti_dati.append(df)
     if tutti_dati:
         return pd.concat(tutti_dati, ignore_index=True, sort=False)
     return pd.DataFrame()
+
+
+def fonti_non_principali(*dataframes):
+    """Insieme delle fonti diverse da "online" presenti nei DataFrame (copia salvata,
+    modalità ridotta). Vuoto = tutto arriva dalla fonte principale."""
+    fonti = set()
+    for d in dataframes:
+        if d is not None and hasattr(d, "columns") and 'FonteDati' in d.columns and len(d) > 0:
+            fonti.update(str(x) for x in d['FonteDati'].dropna().unique())
+    fonti.discard("online")
+    return fonti
+
+
+def avviso_fonte_dati(*dataframes):
+    """Mostra a schermo un avviso per ogni fonte non principale; ritorna l'insieme di fonti."""
+    fonti = fonti_non_principali(*dataframes)
+    for f in sorted(fonti):
+        if f == FONTE_RIDOTTA:
+            st.warning("⚠️ **Modalità ridotta**: football-data.co.uk non è raggiungibile e non c'è una copia salvata, "
+                       "quindi uso football-data.org (solo stagione corrente). Mancano quote, tiri e corner: "
+                       "value bet e statistiche angoli/tiri non sono disponibili, e lo storico è più corto.")
+        else:
+            st.warning(f"⚠️ football-data.co.uk non risponde: sto usando una **{f}**. "
+                       "Le partite più recenti potrebbero mancare. Prova «Riprova a scaricare i dati» nella barra laterale.")
+    return fonti
 
 
 def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
@@ -409,16 +657,28 @@ def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None,
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def carica_fixture_future(id_fd):
+def carica_fixture_future(id_fd, api_key=None):
     df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
     if df is not None:
+        fonte = df.attrs.get("fonte", "online")
         fx = df.copy()
         fx.columns = fx.columns.str.strip()
         if 'Div' in fx.columns:
             fx = fx[fx['Div'] == id_fd].copy()
             fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
             oggi = pd.Timestamp(date.today())
-            return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
+            fx = fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
+            fx['FonteDati'] = fonte
+            return fx
+        return pd.DataFrame()
+
+    # Né online né copia salvata: calendario dalla riserva football-data.org (solo squadre e date)
+    da_api = _da_api_come_stagione_corrente(id_fd, api_key)
+    if da_api is not None:
+        fx = da_api[da_api['Status'].isin(['SCHEDULED', 'TIMED'])].copy()
+        fx = fx[fx['Date_parsed'] >= pd.Timestamp(date.today())]
+        fx['FonteDati'] = FONTE_RIDOTTA
+        return fx.sort_values('Date_parsed').reset_index(drop=True)
     return pd.DataFrame()
 
 
@@ -817,6 +1077,13 @@ with st.sidebar:
         value=True,
         help="Corregge le probabilità sulla base della verifica storica. Disattiva per confrontare prima/dopo."
     )
+    st.divider()
+    # Il clic rilancia lo script: svuotando la cache, i dati vengono riscaricati da capo.
+    # Utile se è partita una fonte di riserva e football-data.co.uk nel frattempo è tornato.
+    if st.button("🔄 Riprova a scaricare i dati"):
+        st.cache_data.clear()
+
+modalita_ridotta = False   # True solo se i dati del campionato arrivano dalla fonte di riserva (senza tiri/corner)
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)", "📅 Schedina del giorno (multi-campionato)"], horizontal=True)
 
@@ -845,12 +1112,15 @@ if scelta_categoria == "📅 Schedina del giorno (multi-campionato)":
         with st.spinner("Scarico e analizzo tutti i campionati (può richiedere qualche secondo)..."):
             for nome_campionato, info_lega in CAMPIONATI_DOMESTICI.items():
                 id_fd_lega = info_lega["id_fd"]
-                dati_lega = carica_dati_campionato(id_fd_lega)
-                fixture_lega = carica_fixture_future(id_fd_lega)
+                dati_lega = carica_dati_campionato(id_fd_lega, api_key_input)
+                fixture_lega = carica_fixture_future(id_fd_lega, api_key_input)
 
                 if dati_lega is None:
                     avvisi_leghe.append(f"{nome_campionato}: dati storici non disponibili in questo momento.")
                     continue
+                fonti_lega = fonti_non_principali(dati_lega, fixture_lega)
+                if fonti_lega:
+                    avvisi_leghe.append(f"{nome_campionato}: fonte di riserva in uso ({'; '.join(sorted(fonti_lega))}).")
 
                 # FIX — ricerca retroattiva: fixtures.csv contiene SOLO partite
                 # non ancora giocate (una volta giocate spariscono da lì). Se la
@@ -931,12 +1201,15 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
     id_fd = info["id_fd"]
 
     with st.spinner("Caricamento dataset campionato e quote automatiche..."):
-        dati = carica_dati_campionato(id_fd)
-        fixture_future = carica_fixture_future(id_fd)
+        dati = carica_dati_campionato(id_fd, api_key_input)
+        fixture_future = carica_fixture_future(id_fd, api_key_input)
 
     if dati is None or len(dati) == 0:
-        st.error("Impossibile scaricare i dati. Riprova tra poco.")
+        st.error("Impossibile scaricare i dati (né da football-data.co.uk, né da una copia salvata"
+                 + (")." if api_key_input else ", e senza chiave API non posso usare la fonte di riserva football-data.org).")
+                 + " Riprova tra poco.")
         st.stop()
+    modalita_ridotta = FONTE_RIDOTTA in avviso_fonte_dati(dati, fixture_future)
 
     opzioni_partite, mappa_partite = [], []
     if not fixture_future.empty:
@@ -1176,7 +1449,7 @@ else:
 
     with st.spinner("Connessione alle API delle Coppe e caricamento dati di supporto..."):
         risultato_api = carica_dati_api_europee(code_api, api_key_input)
-        df_globale = carica_tutti_i_campionati()
+        df_globale = carica_tutti_i_campionati(api_key_input)
 
     if isinstance(risultato_api, str) and risultato_api == "ERRORE_403":
         st.error("❌ **Accesso Negato (Errore 403)**: la tua chiave API gratuita non ha accesso a questa competizione.")
@@ -1190,6 +1463,7 @@ else:
         st.error("Nessun dato trovato per questa competizione.")
         st.stop()
 
+    avviso_fonte_dati(df_globale)
     dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
     dati_future = dati[dati['Status'] != 'FINISHED'].copy()
 
@@ -1247,10 +1521,11 @@ else:
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
         avvisi = []
-        if modello["n_casa"] < SOGLIA_AVVISO:
-            avvisi.append(f"{partita_sel['HomeTeam']} (solo {modello['n_casa']} partite trovate)")
-        if modello["n_trasf"] < SOGLIA_AVVISO:
-            avvisi.append(f"{partita_sel['AwayTeam']} (solo {modello['n_trasf']} partite trovate)")
+        for nome_sq, n_sq in [(partita_sel['HomeTeam'], modello["n_casa"]), (partita_sel['AwayTeam'], modello["n_trasf"])]:
+            if n_sq == 0:
+                avvisi.append(f"{nome_sq} (nessuna partita trovata: nome non riconosciuto o squadra senza storico)")
+            elif n_sq < SOGLIA_AVVISO:
+                avvisi.append(f"{nome_sq} (solo {n_sq} partite trovate)")
         if avvisi:
             st.warning("⚠️ Stima poco affidabile per: " + " e ".join(avvisi) +
                        " — il modello converge verso la media di lega/competizione per compensare "
@@ -1438,5 +1713,9 @@ else:
         nota_stima = ""
         if avvisi:
             nota_stima = " ⚠️ (basate parzialmente sulla media di lega per scarsità di dati specifici)"
-        st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | "
-                f"🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**{nota_stima}")
+        if modalita_ridotta:
+            st.info("🚩 Angoli e 🎯 tiri in porta: non disponibili in modalità ridotta "
+                    "(la fonte di riserva non li include; mostrare i valori medi di default sarebbe fuorviante).")
+        else:
+            st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | "
+                    f"🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**{nota_stima}")
