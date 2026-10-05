@@ -641,7 +641,7 @@ def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None,
     for r in griglia:
         gc, gt, p = r["gc"], r["gt"], r["p"]
         ok = True
-        if segno and r["segno"] != segno:
+        if segno and r["segno"] not in segno:      # segno = "1", "X", "2" oppure doppia chance "1X", "X2", "12"
             ok = False
         if ok and soglia_gol is not None and tipo_soglia:
             tot_g = gc + gt
@@ -771,7 +771,8 @@ def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, qu
     if segno:
         if quote_1x2:
             mappa = {"1": quote_1x2["q_casa_equa"], "X": quote_1x2["q_x_equa"], "2": quote_1x2["q_trasf_equa"]}
-            fattori.append(mappa[segno])
+            # doppia chance (es. "1X"): quota equa = 1 / (somma delle probabilità eque dei due esiti)
+            fattori.append(1.0 / sum(1.0 / mappa[sg] for sg in segno))
         else:
             non_prezzate.append(f"segno {segno}")
     if soglia_gol is not None and tipo_soglia:
@@ -856,16 +857,52 @@ def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos
 
 
 # =====================================================================
-# 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 12 combo automatiche)
+# 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 24 combo automatiche a DUE gambe)
 # Stessa tecnica isotonic regression già validata nell'App Risultati Fissi.
 # Un correttore per 1X2 (corregge "Esito Finale" e il Value Bet), più uno
-# separato per ciascuna delle 12 combinazioni automatiche (segno × Gol/No
-# Gol × Over/Under 2.5) — la verità per allenarle è già nei risultati reali
-# che scarichiamo (nessuna fonte dati nuova serve). Le combo libere con
-# soglie diverse da 2.5 restano SENZA calibrazione: te lo segnaliamo,
-# non lo nascondiamo.
+# separato per ciascuna delle 24 combo: un ESITO (1, X, 2 oppure la doppia
+# chance 1X, X2, 12) abbinato a UNA condizione tra Gol, No Gol, Over 2.5,
+# Under 2.5. Le combo a tre gambe usate in precedenza sono state tolte: i
+# loro vecchi file .pkl non vengono più letti. La verità per allenarle è già
+# nei risultati reali che scarichiamo (nessuna fonte dati nuova serve). Le
+# combo libere con soglie diverse da 2.5 restano SENZA calibrazione.
 # =====================================================================
-LE_12_COMBO = [(s, g, t) for s in ["1", "X", "2"] for g in ["Goal", "NoGoal"] for t in ["Over", "Under"]]
+ESITI_SINGOLI = ["1", "X", "2"]
+ESITI_DOPPIA = ["1X", "X2", "12"]          # 12 = "non pareggia"
+GAMBE_GOL = ["Goal", "NoGoal", "Over", "Under"]   # Over/Under sempre sulla linea 2.5
+CATEGORIE_COMBO = {"singolo": ESITI_SINGOLI, "doppia": ESITI_DOPPIA}
+ETICHETTE_CATEGORIA = {"singolo": "Esito singolo (1/X/2)", "doppia": "Doppia chance (1X/X2/12)"}
+LE_COMBO = [(e, g) for e in ESITI_SINGOLI + ESITI_DOPPIA for g in GAMBE_GOL]
+
+
+def chiave_combo(esito, gamba):
+    return f"{esito}_{gamba}"
+
+
+def etichetta_combo(esito, gamba):
+    nome = {"Goal": "Gol", "NoGoal": "No Gol", "Over": "Over 2.5", "Under": "Under 2.5"}[gamba]
+    return f"{esito} + {nome}"
+
+
+def calcola_combo_2_gambe(griglia, esito, gamba):
+    """Probabilità (%) di: esito (anche doppia chance, es. "1X") + una condizione sui gol."""
+    if gamba in ("Goal", "NoGoal"):
+        return calcola_combo_libera(griglia, segno=esito, gol_nogol=gamba)
+    return calcola_combo_libera(griglia, segno=esito, soglia_gol=2.5, tipo_soglia=gamba)
+
+
+def combo_avverata(esito, gamba, fthg, ftag):
+    """True se la combo si è avverata con il risultato reale fthg-ftag."""
+    reale = '1' if fthg > ftag else ('2' if fthg < ftag else 'X')
+    if reale not in esito:
+        return False
+    if gamba == "Goal":
+        return fthg > 0 and ftag > 0
+    if gamba == "NoGoal":
+        return not (fthg > 0 and ftag > 0)
+    if gamba == "Over":
+        return (fthg + ftag) > 2.5
+    return (fthg + ftag) < 2.5
 
 
 def _path_calibratore(id_fd, chiave="1x2"):
@@ -890,6 +927,25 @@ def carica_calibratore(id_fd, chiave="1x2"):
         except Exception:
             return None
     return None
+
+
+def carica_calibratori_combo(id_fd):
+    """Carica una sola volta i calibratori delle 24 combo: {chiave: info o None}."""
+    return {chiave_combo(e, g): carica_calibratore(id_fd, chiave_combo(e, g)) for (e, g) in LE_COMBO}
+
+
+def probabilita_tutte_le_combo(griglia, calibratori=None):
+    """{(esito, gamba): (probabilità %, calibrata sì/no)} per le 24 combo."""
+    out = {}
+    for (e, g) in LE_COMBO:
+        prob = calcola_combo_2_gambe(griglia, e, g)
+        calibrata = False
+        info = calibratori.get(chiave_combo(e, g)) if calibratori else None
+        if info:
+            prob = float(info["calibratore"].predict([prob / 100])[0]) * 100
+            calibrata = True
+        out[(e, g)] = (prob, calibrata)
+    return out
 
 
 def _allena_isotonic(osservazioni):
@@ -919,10 +975,10 @@ def applica_calibrazione_1x2(modello, calibratore):
 def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
     """Un'unica passata sui dati storici: per ogni partita calcola il modello
     UNA volta, poi costruisce le osservazioni (predetto, avverato) per 1X2 e
-    per tutte e 12 le combo insieme — efficiente, una sola passata."""
+    per tutte e 24 le combo insieme — efficiente, una sola passata."""
     tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
     oss_1x2 = []
-    oss_combo = {c: [] for c in LE_12_COMBO}
+    oss_combo = {c: [] for c in LE_COMBO}
 
     for i in range(15, len(tutte)):
         partita = tutte.iloc[i]
@@ -936,14 +992,9 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
         oss_1x2.append((m['prob_X']/100, esito == 'X'))
         oss_1x2.append((m['prob_2']/100, esito == '2'))
 
-        tot_gol_reale = partita['FTHG'] + partita['FTAG']
-        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
-        for (segno_c, gg_c, tipo_c) in LE_12_COMBO:
-            prob_c = calcola_combo_libera(m['griglia'], segno=segno_c, soglia_gol=2.5, tipo_soglia=tipo_c, gol_nogol=gg_c)
-            avverato_c = (segno_c == esito) and \
-                         ((gg_c == "Goal") == entrambe_reale) and \
-                         ((tipo_c == "Over") == (tot_gol_reale > 2.5))
-            oss_combo[(segno_c, gg_c, tipo_c)].append((prob_c/100, avverato_c))
+        for (e_c, g_c) in LE_COMBO:
+            prob_c = calcola_combo_2_gambe(m['griglia'], e_c, g_c)
+            oss_combo[(e_c, g_c)].append((prob_c/100, combo_avverata(e_c, g_c, partita['FTHG'], partita['FTAG'])))
 
     risultati = {"1x2": {"n": len(oss_1x2), "ok": False}}
     cal_1x2 = _allena_isotonic(oss_1x2)
@@ -951,8 +1002,8 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
         _salva_calibratore(id_fd, "1x2", cal_1x2, len(oss_1x2))
         risultati["1x2"]["ok"] = True
 
-    for chiave_c, oss_c in oss_combo.items():
-        nome_chiave = f"{chiave_c[0]}_{chiave_c[1]}_{chiave_c[2]}"
+    for (e_c, g_c), oss_c in oss_combo.items():
+        nome_chiave = chiave_combo(e_c, g_c)
         cal_c = _allena_isotonic(oss_c)
         risultati[nome_chiave] = {"n": len(oss_c), "ok": cal_c is not None}
         if cal_c:
@@ -963,20 +1014,24 @@ def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
 
 # =====================================================================
 # 🔧 BACKTEST COMBO — stessa logica del backtest 1X2 senza filtro, applicata
-# alla combo automatica più probabile di ogni partita (tra le 12 possibili).
-# Usa la calibrazione per-combo se disponibile e attiva, e la stessa verità
-# (risultato reale) già usata per allenarle — nessuna fonte dati nuova.
+# alle combo a due gambe. Per ogni partita si valutano DUE previsioni nella
+# stessa passata (il modello viene calcolato una volta sola): la combo più
+# probabile tra quelle con esito singolo (1/X/2) e quella tra le doppie
+# chance (1X/X2/12). Usa la calibrazione per-combo se disponibile e attiva,
+# e la stessa verità (risultato reale) già usata per allenarle.
 # =====================================================================
 def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
                            usa_calibrazione=False, richiedi_accordo_mercato=False, richiedi_accordo_ou=False):
-    """richiedi_accordo_mercato: valuta solo le combo il cui SEGNO è d'accordo
-    col favorito del mercato (idea #1, già validata su 1X2: +5/+10 punti).
-    richiedi_accordo_ou (idea #1b, DA VERIFICARE): in aggiunta, richiede che
-    anche la componente OVER/UNDER sia d'accordo con la quota di mercato
-    Over/Under 2.5 — copre una seconda delle tre dimensioni di una combo
-    (il filtro sul solo segno ne copre una su tre, la terza — Gol/No Gol —
-    resta comunque non filtrabile: non esiste una quota di mercato gratuita
-    per quel mercato nei file che usiamo)."""
+    """Ritorna None, oppure {"singolo": r, "doppia": r} con r = n_partite, n_corrette,
+    per_combo e i conteggi delle partite scartate dai filtri.
+
+    richiedi_accordo_mercato: valuta solo le combo il cui ESITO è compatibile col
+    favorito del mercato (per la doppia chance basta che il favorito sia uno dei due
+    esiti coperti; idea #1, già validata su 1X2).
+    richiedi_accordo_ou (idea #1b, DA VERIFICARE): in aggiunta, quando la combo
+    prevista contiene Over/Under, richiede l'accordo con la quota di mercato
+    Over/Under 2.5. Le combo con Gol/No Gol non hanno una quota di mercato nei file
+    che usiamo: su di esse questo filtro non può agire e la partita passa."""
     tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
     ha_stagione = 'Stagione' in tutte.columns
 
@@ -988,11 +1043,18 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
     if not indici:
         return None
 
+    # I 24 calibratori si leggono UNA volta, non a ogni partita.
+    calibratori = carica_calibratori_combo(id_fd) if (usa_calibrazione and id_fd) else None
     colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
     colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, "2.5")
-    n_partite, n_corrette = 0, 0
-    n_scartate_disaccordo, n_scartate_disaccordo_ou, n_scartate_no_quote = 0, 0, 0
-    per_combo = {f"{s}_{g}_{t}": {"previste": 0, "corrette": 0} for (s, g, t) in LE_12_COMBO}
+    servono_quote = richiedi_accordo_mercato or richiedi_accordo_ou
+
+    risultati = {
+        cat: {"n_partite": 0, "n_corrette": 0, "n_scartate_disaccordo": 0,
+              "n_scartate_disaccordo_ou": 0, "n_scartate_no_quote": 0,
+              "per_combo": {chiave_combo(e, g): {"previste": 0, "corrette": 0} for e in esiti for g in GAMBE_GOL}}
+        for cat, esiti in CATEGORIE_COMBO.items()
+    }
 
     for i in indici:
         partita = tutte.iloc[i]
@@ -1001,64 +1063,49 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
                                       emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
         if m is None: continue
 
-        probabilita_combo = {}
-        for (s, g, t) in LE_12_COMBO:
-            nome_chiave = f"{s}_{g}_{t}"
-            prob_grezza = calcola_combo_libera(m['griglia'], segno=s, soglia_gol=2.5, tipo_soglia=t, gol_nogol=g)
-            prob_finale = prob_grezza
-            if usa_calibrazione and id_fd:
-                calib_c = carica_calibratore(id_fd, nome_chiave)
-                if calib_c:
-                    prob_finale = float(calib_c["calibratore"].predict([prob_grezza/100])[0]) * 100
-            probabilita_combo[nome_chiave] = prob_finale
+        probs = probabilita_tutte_le_combo(m['griglia'], calibratori)
+        quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a) if servono_quote else None
+        quote_ou = quote_over_under_normalizzate(partita, colonne_over, colonne_under) if richiedi_accordo_ou else None
 
-        combo_prevista = max(probabilita_combo, key=probabilita_combo.get)
-        s_p, g_p, t_p = combo_prevista.split("_")
+        for cat, esiti in CATEGORIE_COMBO.items():
+            r = risultati[cat]
+            candidate = {(e, g): probs[(e, g)][0] for e in esiti for g in GAMBE_GOL}
+            e_p, g_p = max(candidate, key=candidate.get)
 
-        if richiedi_accordo_mercato or richiedi_accordo_ou:
-            quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
-            if quote is None:
-                n_scartate_no_quote += 1
-                continue
+            if servono_quote:
+                if quote is None:
+                    r["n_scartate_no_quote"] += 1
+                    continue
+                if richiedi_accordo_mercato:
+                    quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
+                    favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)
+                    if favorito_mercato not in e_p:
+                        r["n_scartate_disaccordo"] += 1
+                        continue
+                if richiedi_accordo_ou and g_p in ("Over", "Under"):
+                    if quote_ou is None:
+                        r["n_scartate_no_quote"] += 1
+                        continue
+                    favorito_ou_mercato = "Over" if quote_ou["q_over_equa"] < quote_ou["q_under_equa"] else "Under"
+                    if g_p != favorito_ou_mercato:
+                        r["n_scartate_disaccordo_ou"] += 1
+                        continue
 
-        if richiedi_accordo_mercato:
-            quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
-            favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)
-            if s_p != favorito_mercato:
-                n_scartate_disaccordo += 1
-                continue
+            avverata = combo_avverata(e_p, g_p, partita['FTHG'], partita['FTAG'])
+            r["n_partite"] += 1
+            r["per_combo"][chiave_combo(e_p, g_p)]["previste"] += 1
+            if avverata:
+                r["n_corrette"] += 1
+                r["per_combo"][chiave_combo(e_p, g_p)]["corrette"] += 1
 
-        if richiedi_accordo_ou:
-            quote_ou = quote_over_under_normalizzate(partita, colonne_over, colonne_under)
-            if quote_ou is None:
-                n_scartate_no_quote += 1
-                continue
-            favorito_ou_mercato = "Over" if quote_ou["q_over_equa"] < quote_ou["q_under_equa"] else "Under"
-            if t_p != favorito_ou_mercato:
-                n_scartate_disaccordo_ou += 1
-                continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        tot_gol_reale = partita['FTHG'] + partita['FTAG']
-        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
-        avverata = (s_p == esito) and ((g_p == "Goal") == entrambe_reale) and ((t_p == "Over") == (tot_gol_reale > 2.5))
-
-        n_partite += 1
-        per_combo[combo_prevista]["previste"] += 1
-        if avverata:
-            n_corrette += 1
-            per_combo[combo_prevista]["corrette"] += 1
-
-    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_combo": per_combo,
-            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_disaccordo_ou": n_scartate_disaccordo_ou,
-            "n_scartate_no_quote": n_scartate_no_quote}
+    return risultati
 
 
 # =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
 st.title("⚽ COMBO — Advanced Betting Model")
-st.caption("Modello statistico Dixon-Coles + EWMA + shrinkage, con combo automatiche e value bet")
+st.caption("Modello statistico Dixon-Coles + EWMA + shrinkage, con combo a due gambe (anche doppia chance) e value bet")
 
 # Parametri del modello fissati ai valori di default validati — non più
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
@@ -1290,13 +1337,17 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
 
         st.divider()
         st.write("**🔥 Backtest COMBO — accuratezza della combo più probabile**")
-        st.caption("Stessa logica del backtest 1X2, applicata alla combo automatica con probabilità "
-                   "più alta tra le 12 possibili (usa la calibrazione per-combo se allenata e attiva). "
-                   "Più difficile del semplice 1X2 per costruzione: una combo richiede che TRE "
-                   "condizioni si avverino insieme, non una sola.")
-        st.caption("Il checkbox 'Idea #1' qui sopra filtra solo sul segno. Quello qui sotto (idea #1b, "
-                   "da verificare) filtra ANCHE sull'Over/Under — copre 2 delle 3 dimensioni di una combo "
-                   "invece di 1 sola. Prova le combinazioni: nessuno dei due, solo #1, solo #1b, entrambi.")
+        st.caption("Stessa logica del backtest 1X2, applicata alle combo a due gambe. Per ogni partita si "
+                   "valutano DUE previsioni: la combo più probabile con esito singolo (1/X/2) e quella con "
+                   "doppia chance (1X/X2/12), ciascuna abbinata a Gol/No Gol oppure Over/Under 2.5 (usa la "
+                   "calibrazione per-combo se allenata e attiva). Le due categorie non sono confrontabili tra "
+                   "loro — la doppia chance copre due esiti su tre, quindi ha un'accuratezza molto più alta per "
+                   "costruzione — né con i risultati delle vecchie combo a tre gambe.")
+        st.caption("Il checkbox 'Idea #1' qui sopra filtra sull'esito (per la doppia chance basta che il favorito "
+                   "del mercato sia uno dei due esiti coperti). Quello qui sotto (idea #1b, da verificare) filtra "
+                   "ANCHE sull'Over/Under quando la combo prevista lo contiene; sulle combo con Gol/No Gol, che non "
+                   "hanno una quota di mercato, non può filtrare e la partita passa. Prova le combinazioni: nessuno "
+                   "dei due, solo #1, solo #1b, entrambi.")
         richiedi_accordo_ou = st.checkbox(
             "💡 Idea #1b: richiedi accordo anche su Over/Under 2.5 col mercato",
             value=False,
@@ -1312,29 +1363,32 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             if risultato is None:
                 st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
                 return
-            if risultato["n_partite"] == 0:
-                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile (o tutte scartate dai filtri).")
-                return
-            win_rate_combo = risultato["n_corrette"] / risultato["n_partite"] * 100
             st.write(f"**{etichetta}**")
-            c1, c2 = st.columns(2)
-            c1.metric("Partite valutate", risultato["n_partite"])
-            c2.metric("Accuratezza combo", f"{win_rate_combo:.1f}%")
-            if (risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_disaccordo_ou", 0) > 0
-                    or risultato.get("n_scartate_no_quote", 0) > 0):
-                st.caption(f"Scartate per disaccordo sul segno: {risultato.get('n_scartate_disaccordo', 0)} — "
-                          f"scartate per disaccordo su Over/Under: {risultato.get('n_scartate_disaccordo_ou', 0)} — "
-                          f"scartate per quote mancanti: {risultato.get('n_scartate_no_quote', 0)}.")
-            righe_combo_bt = []
-            for chiave, d in sorted(risultato["per_combo"].items(), key=lambda x: x[1]["previste"], reverse=True):
-                if d["previste"] == 0: continue
-                wr_c = d["corrette"]/d["previste"]*100
-                righe_combo_bt.append({
-                    "Combo prevista": chiave.replace("_", " "), "Volte prevista": d["previste"],
-                    "Corrette": d["corrette"], "Accuratezza": f"{wr_c:.1f}%",
-                })
-            if righe_combo_bt:
-                st.table(pd.DataFrame(righe_combo_bt))
+            for categoria in CATEGORIE_COMBO:
+                r = risultato[categoria]
+                st.write(f"*{ETICHETTE_CATEGORIA[categoria]}*")
+                if r["n_partite"] == 0:
+                    st.warning("⚠️ Nessuna partita valutabile (o tutte scartate dai filtri).")
+                    continue
+                win_rate_combo = r["n_corrette"] / r["n_partite"] * 100
+                c1, c2 = st.columns(2)
+                c1.metric("Partite valutate", r["n_partite"])
+                c2.metric("Accuratezza combo", f"{win_rate_combo:.1f}%")
+                if r["n_scartate_disaccordo"] > 0 or r["n_scartate_disaccordo_ou"] > 0 or r["n_scartate_no_quote"] > 0:
+                    st.caption(f"Scartate per disaccordo sull'esito: {r['n_scartate_disaccordo']} — "
+                              f"scartate per disaccordo su Over/Under: {r['n_scartate_disaccordo_ou']} — "
+                              f"scartate per quote mancanti: {r['n_scartate_no_quote']}.")
+                righe_combo_bt = []
+                for chiave, d in sorted(r["per_combo"].items(), key=lambda x: x[1]["previste"], reverse=True):
+                    if d["previste"] == 0: continue
+                    wr_c = d["corrette"]/d["previste"]*100
+                    e_k, g_k = chiave.split("_")
+                    righe_combo_bt.append({
+                        "Combo prevista": etichetta_combo(e_k, g_k), "Volte prevista": d["previste"],
+                        "Corrette": d["corrette"], "Accuratezza": f"{wr_c:.1f}%",
+                    })
+                if righe_combo_bt:
+                    st.table(pd.DataFrame(righe_combo_bt))
 
         if cliccato_combo_corrente:
             with st.spinner("Backtest combo su stagione corrente..."):
@@ -1353,15 +1407,16 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             mostra_risultato_backtest_combo(ris_c, "Tutto lo storico disponibile")
 
         if cliccato_combo_corrente or cliccato_combo_tutto:
-            st.caption("Confronta questa accuratezza con quella 1X2 qui sopra: se è molto più bassa, "
-                       "è normale (tre condizioni insieme sono più difficili), non necessariamente "
-                       "un problema — ma dà la misura reale di quanto ci si può fidare delle combo.")
+            st.caption("Confronta questa accuratezza con quella 1X2 qui sopra: se è più bassa, è normale "
+                       "(una combo richiede che due condizioni si avverino insieme, non una sola), non "
+                       "necessariamente un problema — ma dà la misura reale di quanto ci si può fidare delle combo.")
 
         st.divider()
         st.write("**⚡ Test completo automatico (le 8 combinazioni insieme)**")
         st.caption("Invece di lanciare i due bottoni sopra 4 volte a mano (con/senza ciascun filtro) e "
-                   "copiare ogni tabella, questo le fa tutte in un colpo solo e ti dà un file da "
-                   "scaricare e mandarmi direttamente — niente più copia-incolla su Word.")
+                   "copiare ogni tabella, questo le fa tutte in un colpo solo (per entrambe le categorie, "
+                   "esito singolo e doppia chance) e ti dà un file da scaricare e mandarmi direttamente — "
+                   "niente più copia-incolla su Word.")
 
         if st.button("⚡ Esegui tutte le 8 combinazioni per questo campionato"):
             righe_test_completo = []
@@ -1378,23 +1433,23 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             barra_avanzamento = st.progress(0.0, text="Avvio...")
             for idx, (etichetta_periodo, oos, filtro_segno, filtro_ou) in enumerate(combinazioni):
                 barra_avanzamento.progress((idx)/8, text=f"{idx+1}/8 — {etichetta_periodo}, "
-                                           f"segno={'sì' if filtro_segno else 'no'}, O/U={'sì' if filtro_ou else 'no'}...")
+                                           f"esito={'sì' if filtro_segno else 'no'}, O/U={'sì' if filtro_ou else 'no'}...")
                 ris = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val, oos, id_fd=id_fd,
                                             usa_calibrazione=usa_calibrazione,
                                             richiedi_accordo_mercato=filtro_segno, richiedi_accordo_ou=filtro_ou)
-                if ris is None or ris["n_partite"] == 0:
-                    righe_test_completo.append({
+                for categoria in CATEGORIE_COMBO:
+                    r = ris[categoria] if ris is not None else None
+                    riga = {
                         "Campionato": campionato, "Periodo": etichetta_periodo,
-                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
-                        "Partite valutate": 0, "Corrette": 0, "Accuratezza %": None,
-                    })
-                else:
-                    righe_test_completo.append({
-                        "Campionato": campionato, "Periodo": etichetta_periodo,
-                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
-                        "Partite valutate": ris["n_partite"], "Corrette": ris["n_corrette"],
-                        "Accuratezza %": round(ris["n_corrette"]/ris["n_partite"]*100, 1),
-                    })
+                        "Categoria": ETICHETTE_CATEGORIA[categoria],
+                        "Filtro esito": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
+                    }
+                    if r is None or r["n_partite"] == 0:
+                        riga.update({"Partite valutate": 0, "Corrette": 0, "Accuratezza %": None})
+                    else:
+                        riga.update({"Partite valutate": r["n_partite"], "Corrette": r["n_corrette"],
+                                     "Accuratezza %": round(r["n_corrette"]/r["n_partite"]*100, 1)})
+                    righe_test_completo.append(riga)
             barra_avanzamento.progress(1.0, text="Completato!")
 
             df_test_completo = pd.DataFrame(righe_test_completo)
@@ -1412,10 +1467,11 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
 
 
         st.divider()
-        st.write("**🎯 Calibrazione (1X2 + le 12 combo automatiche)**")
+        st.write("**🎯 Calibrazione (1X2 + le 24 combo automatiche)**")
         st.caption("Allena i correttori su tutto lo storico disponibile. Una sola passata sui dati "
-                   "calcola il modello una volta per partita e allena tutti i 13 correttori insieme "
-                   "(1X2 + le 12 combinazioni segno × Gol/No Gol × Over/Under 2.5).")
+                   "calcola il modello una volta per partita e allena tutti i 25 correttori insieme "
+                   "(1X2 + le 24 combinazioni esito, anche doppia chance, × Gol/No Gol/Over/Under 2.5). "
+                   "I vecchi correttori delle combo a tre gambe non vengono più usati: va riallenato.")
         if st.button("🎯 Allena tutte le calibrazioni per questo campionato"):
             with st.spinner("Allenamento in corso (può richiedere qualche secondo)..."):
                 risultati_calib = allena_tutte_le_calibrazioni(dati, rho_val, ewma_span_val, emivita_val, id_fd)
@@ -1426,14 +1482,15 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             else:
                 st.warning(f"⚠️ 1X2: campione insufficiente ({risultati_calib['1x2']['n']} osservazioni, "
                           f"ne servono almeno 100).")
-            st.write(f"**Combo calibrate con successo: {n_combo_ok} su 12.**")
+            st.write(f"**Combo calibrate con successo: {n_combo_ok} su {len(LE_COMBO)}.**")
             righe_combo_calib = []
             for chiave, v in risultati_calib.items():
                 if chiave == "1x2": continue
-                righe_combo_calib.append({"Combo": chiave.replace("_", " "), "Osservazioni": v["n"],
+                e_k, g_k = chiave.split("_")
+                righe_combo_calib.append({"Combo": etichetta_combo(e_k, g_k), "Osservazioni": v["n"],
                                           "Calibrata": "✅" if v["ok"] else "⚠️ campione scarso"})
             st.dataframe(pd.DataFrame(righe_combo_calib), use_container_width=True, hide_index=True)
-            st.caption("Le combo più rare (es. 'X + NoGoal + Over') hanno naturalmente meno osservazioni "
+            st.caption("Le combo più rare (es. 'X + Over 2.5') hanno naturalmente meno osservazioni "
                        "delle più comuni — è normale, non un errore.")
 
 else:
@@ -1640,64 +1697,47 @@ else:
         st.dataframe(crea_tabella(modello['combo'], "Combinazione"), use_container_width=True, hide_index=True)
 
         # =====================================================================
-        # 🏆 TOP COMBO AUTOMATICHE
-        # Scopre da sola le combinazioni più probabili tra tutte le 12
-        # possibili (segno × Gol/No Gol × Over/Under 2.5), riusando la stessa
-        # funzione calcola_combo_libera del motore libero qui sotto — nessuna
-        # logica duplicata, un solo posto dove le combo vengono calcolate.
+        # 🏆 TOP COMBO AUTOMATICHE — a DUE gambe: un esito (1/X/2 oppure doppia
+        # chance 1X/X2/12) + una condizione tra Gol, No Gol, Over 2.5, Under 2.5.
+        # Due liste separate: la doppia chance copre due esiti su tre e
+        # occuperebbe quasi sempre i primi posti di una classifica unica.
+        # Riusa calcola_combo_libera (un solo posto dove le combo vengono calcolate).
         # =====================================================================
-        st.markdown("### 🏆 Top 4 Combo Automatiche (su Over/Under 2.5)")
-        st.caption("Tutte le 12 combinazioni possibili (1/X/2 × Gol/No Gol × Over/Under 2.5), calibrate "
-                   "se disponibile, filtrate per affidabilità (esclude combo troppo rare o su dati scarsi) "
-                   "e ordinate per probabilità.")
+        st.markdown("### 🏆 Top 3 Combo Automatiche")
+        st.caption("Combo a due gambe: un esito (1/X/2, oppure doppia chance 1X/X2/12) abbinato a Gol, No Gol, "
+                   "Over 2.5 o Under 2.5. Probabilità calibrate se disponibile (🎯). Due liste separate, perché "
+                   "la doppia chance, coprendo due esiti su tre, avrebbe quasi sempre le probabilità più alte.")
 
-        # Punto A — filtro di affidabilità: escludiamo le combo troppo rare
-        # (rumore, non segnale) o calcolate su squadre con pochi dati specifici.
-        SOGLIA_MIN_PROB_COMBO = 8.0  # sotto questa probabilità, troppo raro per essere utile
         dati_scarsi = bool(avvisi)
-
-        tutte_le_combo = {}
-        for segno_auto in ["1", "X", "2"]:
-            for gg_auto in ["Goal", "NoGoal"]:
-                for tipo_auto in ["Over", "Under"]:
-                    prob_grezza = calcola_combo_libera(modello['griglia'], segno=segno_auto, soglia_gol=2.5,
-                                                        tipo_soglia=tipo_auto, gol_nogol=gg_auto)
-                    nome_chiave = f"{segno_auto}_{gg_auto}_{tipo_auto}"
-                    prob_finale = prob_grezza
-                    calib_combo_info = None
-                    if not is_coppa and usa_calibrazione:
-                        calib_combo_info = carica_calibratore(id_fd, nome_chiave)
-                        if calib_combo_info:
-                            prob_finale = float(calib_combo_info["calibratore"].predict([prob_grezza/100])[0]) * 100
-                    chiave_vis = f"{segno_auto} + {'Gol' if gg_auto=='Goal' else 'No Gol'} + {tipo_auto} 2.5"
-                    tutte_le_combo[chiave_vis] = {
-                        "prob": prob_finale, "segno": segno_auto, "tipo": tipo_auto,
-                        "calibrata": calib_combo_info is not None,
-                    }
-
-        combo_affidabili = {k: v for k, v in tutte_le_combo.items() if v["prob"] >= SOGLIA_MIN_PROB_COMBO}
-        top4_combo = dict(sorted(combo_affidabili.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
+        calibratori_combo = carica_calibratori_combo(id_fd) if (not is_coppa and usa_calibrazione) else None
+        prob_combo = probabilita_tutte_le_combo(modello['griglia'], calibratori_combo)
 
         if dati_scarsi:
             st.warning("⚠️ Combo calcolate su dati limitati per una delle due squadre (vedi avviso sopra) "
                       "— trattale con più cautela del solito.")
-        if not top4_combo:
-            st.info(f"Nessuna combo sopra la soglia minima di affidabilità ({SOGLIA_MIN_PROB_COMBO}%) "
-                   "per questa partita.")
-        else:
-            righe_top4 = []
-            for chiave, info_c in top4_combo.items():
-                q_stimata, non_prezzate = stima_quota_combo_approssimata(info_c["segno"], 2.5, info_c["tipo"], quote, quote_ou_25)
-                righe_top4.append({
-                    "Combo": chiave + (" 🎯" if info_c["calibrata"] else ""),
-                    "Probabilità (%)": f"{info_c['prob']:.1f}%",
-                    "Quota stimata*": f"~{q_stimata:.2f}" if q_stimata else "n/d",
+
+        for categoria, esiti_cat in CATEGORIE_COMBO.items():
+            st.markdown(f"**{ETICHETTE_CATEGORIA[categoria]}**")
+            top3 = sorted(((e, g) for e in esiti_cat for g in GAMBE_GOL),
+                          key=lambda c: prob_combo[c][0], reverse=True)[:3]
+            righe_top3 = []
+            for (e_c, g_c) in top3:
+                prob_c, calibrata_c = prob_combo[(e_c, g_c)]
+                con_ou = g_c in ("Over", "Under")
+                q_stimata, non_prezzate = stima_quota_combo_approssimata(
+                    e_c, 2.5 if con_ou else None, g_c if con_ou else None, quote, quote_ou_25)
+                quota_ok = bool(q_stimata) and con_ou and not non_prezzate
+                righe_top3.append({
+                    "Combo": etichetta_combo(e_c, g_c) + (" 🎯" if calibrata_c else ""),
+                    "Probabilità (%)": f"{prob_c:.1f}%",
+                    "Quota stimata*": f"~{q_stimata:.2f}" if quota_ok else "n/d",
                 })
-            st.dataframe(pd.DataFrame(righe_top4), use_container_width=True, hide_index=True)
-            st.caption("🎯 = probabilità corretta con calibrazione specifica per questa combo. "
-                       "*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
-                       "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
-                       "non entra nella stima: il numero reale del bookmaker sarà diverso.")
+            st.dataframe(pd.DataFrame(righe_top3), use_container_width=True, hide_index=True)
+        st.caption("🎯 = probabilità corretta con calibrazione specifica per questa combo. "
+                   "*Quota STIMATA solo per le combo con Over/Under: esito dalle quote 1X2 (la doppia chance dalle "
+                   "probabilità eque 1X2) × Over/Under 2.5, come se fossero indipendenti — non lo sono del tutto. "
+                   "Sono quote EQUE, cioè senza il margine del bookmaker: quelle reali sono più basse. Gol/No Gol "
+                   "non ha una quota nei file, quindi per quelle combo il valore è n/d.")
 
         st.divider()
         st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
