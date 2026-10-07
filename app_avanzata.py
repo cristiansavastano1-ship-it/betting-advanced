@@ -35,7 +35,15 @@ CAMPIONATI_COPPE = {
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
-K_SHRINKAGE = 10  # stesso principio già validato nell'App Risultati Fissi
+# Shrinkage: peso della squadra = n / (n + K). K=5 (era 10) dopo il test su Serie A (415 partite):
+# a parità di finestra di forma, K=5 è il migliore sia con tanto storico sia nelle prime giornate;
+# K=1 peggiora nelle prime giornate, K>=20 toglie troppa informazione.
+K_SHRINKAGE = 5
+
+# Versione del modello: entra nel nome dei file di calibrazione. Se i parametri del modello
+# cambiano, si aumenta questo valore e i vecchi file (tarati sul modello precedente) vengono
+# ignorati invece di essere applicati per errore: basta riallenare con il pulsante apposito.
+VERSIONE_MODELLO = "v2"
 
 
 # =====================================================================
@@ -717,11 +725,26 @@ def carica_dati_api_europee(codice_competizione, api_key):
 # bug dell'overround già corretto nell'App Risultati Fissi. Ora: media di
 # tutti i bookmaker disponibili nel file, quota "equa" depurata dal margine.
 # =====================================================================
+# 🔧 SELEZIONE DELLE COLONNE QUOTA (corretta)
+# Prima si prendevano TUTTE le colonne che finiscono per H, D o A. Nei file di football-data.co.uk
+# questo includeva anche le quote dell'HANDICAP ASIATICO (es. B365AHH, PAHH, MaxAHH: finiscono per H e A ma
+# non hanno la colonna D) e i valori aggregati Max/Avg, che non sono bookmaker. Risultato misurato sulla
+# Serie A: margine mostrato ~10% invece di ~5%, quota casa equa 2.69 invece di 3.04, 23 colonne "casa"
+# contro 13 "pareggio". Ora una colonna è una quota 1X2 solo se esiste la TRIPLETTA <sigla>H/<sigla>D/<sigla>A
+# e la sigla non è un aggregato (Max, Avg, BbMx, BbAv). Così le tre liste hanno sempre gli stessi bookmaker.
+_PREFISSI_AGGREGATI = ("Max", "Avg", "BbMx", "BbAv")
+
+
 def classifica_colonne_quote(colonne):
-    apertura_h = [c for c in colonne if c.endswith('H') and not c.endswith('CH') and c not in ['FTHG', 'HTHG', 'PTHG']]
-    apertura_d = [c for c in colonne if c.endswith('D') and not c.endswith('CD') and c not in ['FTHG', 'FTAG', 'HTHG', 'HTAG']]
-    apertura_a = [c for c in colonne if c.endswith('A') and not c.endswith('CA') and c not in ['FTAG', 'HTAG', 'PTAG']]
-    return apertura_h, apertura_d, apertura_a
+    colonne = list(colonne)
+    presenti = set(colonne)
+    prefissi = []
+    for c in colonne:
+        if c.endswith('H') and not c.endswith('CH') and c not in ['FTHG', 'HTHG', 'PTHG']:
+            p = c[:-1]
+            if p and (p + 'D') in presenti and (p + 'A') in presenti and not p.startswith(_PREFISSI_AGGREGATI):
+                prefissi.append(p)
+    return [p + 'H' for p in prefissi], [p + 'D' for p in prefissi], [p + 'A' for p in prefissi]
 
 
 def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
@@ -748,9 +771,17 @@ def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
 # disponibile nel file, quindi non entra nella stima — etichettato chiaramente.
 # =====================================================================
 def classifica_colonne_over_under(colonne, soglia="2.5"):
-    over_cols = [c for c in colonne if c.endswith(f'>{soglia}')]
-    under_cols = [c for c in colonne if c.endswith(f'<{soglia}')]
-    return over_cols, under_cols
+    """Stesse regole delle quote 1X2: serve la coppia <sigla>>2.5 / <sigla><2.5, niente aggregati Max/Avg,
+    e niente quote di chiusura (sigla che finisce per C quando esiste anche quella di apertura), perché
+    mescolare apertura e chiusura falserebbe la media."""
+    colonne = list(colonne)
+    presenti = set(colonne)
+    suffisso_o, suffisso_u = f'>{soglia}', f'<{soglia}'
+    prefissi_coppia = [c[:-len(suffisso_o)] for c in colonne
+                       if c.endswith(suffisso_o) and (c[:-len(suffisso_o)] + suffisso_u) in presenti]
+    prefissi = [p for p in prefissi_coppia
+                if p and not p.startswith(_PREFISSI_AGGREGATI) and not (p.endswith('C') and p[:-1] in prefissi_coppia)]
+    return [p + suffisso_o for p in prefissi], [p + suffisso_u for p in prefissi]
 
 
 def quote_over_under_normalizzate(riga, colonne_over, colonne_under):
@@ -909,7 +940,7 @@ def combo_avverata(esito, gamba, fthg, ftag):
 
 
 def _path_calibratore(id_fd, chiave="1x2"):
-    return f"calibratore_combo_{chiave}_{id_fd}.pkl"
+    return f"calibratore_{VERSIONE_MODELLO}_combo_{chiave}_{id_fd}.pkl"
 
 
 def _salva_calibratore(id_fd, chiave, calibratore, n_oss):
@@ -1144,7 +1175,9 @@ st.caption("Modello statistico Dixon-Coles + EWMA + shrinkage, con combo a due g
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
 # sapere cosa fanno per essere usati bene, e nell'uso normale non si toccano.
 rho_val = -0.10        # correzione Dixon-Coles (valore tipico da letteratura)
-ewma_span_val = 6      # finestra della forma recente
+ewma_span_val = 100    # finestra della forma: lunga (era 6). Test su Serie A: 6 partite sono rumore;
+                       # da ~30 in su i punteggi (log-loss, RPS) migliorano nettamente e restano piatti
+                       # fino a ~300 (= media su tutta la storia). Vale anche per tiri e corner (non verificato).
 emivita_val = 180      # decadimento temporale in giorni
 
 with st.sidebar:
@@ -1523,7 +1556,8 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
         st.caption("Allena i correttori su tutto lo storico disponibile. Una sola passata sui dati "
                    "calcola il modello una volta per partita e allena tutti i 37 correttori insieme "
                    "(1X2 + le 36 combinazioni esito, anche doppia chance, × Gol/No Gol/Over-Under 2.5/Over 1.5/Under 3.5). "
-                   "I vecchi correttori delle combo a tre gambe non vengono più usati: va riallenato.")
+                   "I vecchi correttori (combo a tre gambe, o tarati su una versione precedente del modello) non vengono "
+                   "più usati: va riallenato dopo ogni modifica del modello.")
         if st.button("🎯 Allena tutte le calibrazioni per questo campionato"):
             with st.spinner("Allenamento in corso (può richiedere qualche secondo)..."):
                 risultati_calib = allena_tutte_le_calibrazioni(dati, rho_val, ewma_span_val, emivita_val, id_fd)
