@@ -11,25 +11,27 @@ import unicodedata
 from functools import lru_cache
 from datetime import datetime, date
 from scipy.stats import poisson
+from scipy.optimize import least_squares
 from sklearn.isotonic import IsotonicRegression
 
 st.set_page_config(page_title="COMBO - Advanced Betting Model", page_icon="⚽", layout="centered")
 
-# "code_api" = codice della stessa competizione su football-data.org, usato
-# solo come fonte di RISERVA quando football-data.co.uk non risponde.
+# "code_api"  = codice football-data.org (riserva quando co.uk non risponde)
+# "id_apif"   = id lega su API-Football (https://v3.football.api-sports.io)
 CAMPIONATI_DOMESTICI = {
-    "Italia - Serie A": {"id_fd": "I1", "code_api": "SA"},
-    "Inghilterra - Premier League": {"id_fd": "E0", "code_api": "PL"},
-    "Spagna - La Liga": {"id_fd": "SP1", "code_api": "PD"},
-    "Germania - Bundesliga": {"id_fd": "D1", "code_api": "BL1"},
-    "Francia - Ligue 1": {"id_fd": "F1", "code_api": "FL1"},
+    "Italia - Serie A":              {"id_fd": "I1",  "code_api": "SA",  "id_apif": 135},
+    "Inghilterra - Premier League":  {"id_fd": "E0",  "code_api": "PL",  "id_apif": 39},
+    "Spagna - La Liga":              {"id_fd": "SP1", "code_api": "PD",  "id_apif": 140},
+    "Germania - Bundesliga":         {"id_fd": "D1",  "code_api": "BL1", "id_apif": 78},
+    "Francia - Ligue 1":             {"id_fd": "F1",  "code_api": "FL1", "id_apif": 61},
 }
 CODICE_API_PER_ID_FD = {v["id_fd"]: v["code_api"] for v in CAMPIONATI_DOMESTICI.values()}
+ID_APIF_PER_ID_FD    = {v["id_fd"]: v["id_apif"] for v in CAMPIONATI_DOMESTICI.values()}
 
 CAMPIONATI_COPPE = {
-    "🌍 UEFA Champions League": {"code": "CL", "gratis_confermato": True},
-    "🌍 UEFA Europa League": {"code": "EL", "gratis_confermato": False},
-    "🌍 UEFA Conference League": {"code": "UECL", "gratis_confermato": False},
+    "🌍 UEFA Champions League":  {"code": "CL",   "id_apif": 2,   "gratis_confermato": True},
+    "🌍 UEFA Europa League":     {"code": "EL",   "id_apif": 3,   "gratis_confermato": False},
+    "🌍 UEFA Conference League": {"code": "UECL", "id_apif": 848, "gratis_confermato": False},
 }
 
 HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -576,6 +578,21 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
     lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
     lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
 
+    esiti = esiti_da_lambda(lam_c, lam_t, rho)
+    return {
+        **esiti,
+        "angoli_stimati": f"{corner_casa_finale + corner_trasf_finale:.1f}",
+        "tiri_stimati": f"{tiri_casa_finale + tiri_trasf_finale:.1f}",
+        "n_casa": n_casa, "n_trasf": n_trasf,
+        "lam_c": lam_c, "lam_t": lam_t,        # gol attesi: servono per l'ancoraggio al mercato
+    }
+
+
+# =====================================================================
+# 🔧 ESITI DA GOL ATTESI — la parte "griglia dei risultati" del modello, estratta in una funzione
+# (identica a prima) per poterla riusare con gol attesi ricavati dal mercato.
+# =====================================================================
+def esiti_da_lambda(lam_c, lam_t, rho):
     prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
     prob_goal, prob_nogoal = 0.0, 0.0
     limiti_under = [1.5, 2.5, 3.5]
@@ -628,10 +645,80 @@ def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho
         "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
         "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
         "combo": combo_stats, "griglia": griglia_risultati,
-        "angoli_stimati": f"{corner_casa_finale + corner_trasf_finale:.1f}",
-        "tiri_stimati": f"{tiri_casa_finale + tiri_trasf_finale:.1f}",
-        "n_casa": n_casa, "n_trasf": n_trasf,
     }
+
+
+# =====================================================================
+# 🧲 MODALITÀ ANCORATA AL MERCATO
+# Test su Serie A e Ligue 1: sul 1X2 il mercato (media di ~8 bookmaker, margine tolto) batte il modello a gol
+# storici (log-loss 0.975 contro 1.005 e 0.989 contro 1.030) e mescolare i due non aiuta (peso migliore del
+# modello = 0). Ricavando i gol attesi che riproducono le probabilità eque del mercato (1X2 + Over/Under 2.5)
+# e calcolando le combo dalla stessa griglia, le combo diventano molto meglio calibrate: scarto tra reale e
+# previsto sulla combo scelta da -11/-9 a -3/-4 in Ligue 1 e da -3/-4 a +1/-1 in Serie A.
+# ATTENZIONE: per costruzione questa modalità NON trova value bet su 1X2 e Over/Under 2.5, perché riproduce
+# il mercato. Serve a leggere il mercato in forma di combo (Gol + esito, ecc.), non a batterlo.
+# =====================================================================
+_GG = np.arange(8)
+_GC, _GT = np.meshgrid(_GG, _GG, indexing="ij")
+_M1, _MX, _M2, _MOVER25 = _GC > _GT, _GC == _GT, _GC < _GT, (_GC + _GT) > 2.5
+
+
+def _griglia_np(lc, lt, rho):
+    G = np.outer(poisson.pmf(_GG, lc), poisson.pmf(_GG, lt))
+    for gi, gj in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        G[gi, gj] *= tau_dixon_coles(gi, gj, lc, lt, rho)
+    return G / G.sum()
+
+
+def lambda_ancorate(quote_1x2, quote_ou25, rho, lam_start):
+    """Gol attesi (casa, trasferta) che riproducono le probabilità eque 1X2 (e Over 2.5 se disponibile).
+    Ritorna (lam_c, lam_t) oppure None se le quote non sono valide o la ricerca non converge bene."""
+    try:
+        m = np.array([1.0 / quote_1x2['q_casa_equa'], 1.0 / quote_1x2['q_x_equa'], 1.0 / quote_1x2['q_trasf_equa']])
+        if (not np.all(np.isfinite(m))) or abs(m.sum() - 1.0) > 0.02:
+            return None
+        mo = (1.0 / quote_ou25['q_over_equa']) if quote_ou25 else None
+        if mo is not None and not (0.0 < mo < 1.0):
+            mo = None
+        lam0 = np.array(lam_start, dtype=float)
+
+        def residui(x):
+            G = _griglia_np(np.exp(x[0]), np.exp(x[1]), rho)
+            r = [G[_M1].sum() - m[0], G[_MX].sum() - m[1], G[_M2].sum() - m[2]]
+            # senza Over/Under il livello dei gol non è vincolato dal mercato: lo si tiene vicino al modello
+            r.append((G[_MOVER25].sum() - mo) if mo is not None else 0.25 * (np.exp(x).sum() - lam0.sum()))
+            return r
+
+        sol = least_squares(residui, np.log(lam0), bounds=(np.log(0.15), np.log(5.0)))
+        if not sol.success or np.max(np.abs(sol.fun[:3])) > 0.03:
+            return None
+        return float(np.exp(sol.x[0])), float(np.exp(sol.x[1]))
+    except Exception:
+        return None
+
+
+def modello_ancorato(modello, quote_1x2, quote_ou25, rho):
+    """Copia del modello con griglia e probabilità ricalcolate dai gol attesi del mercato; None se non possibile."""
+    if modello is None or not quote_1x2 or 'lam_c' not in modello:
+        return None
+    lam = lambda_ancorate(quote_1x2, quote_ou25, rho, (modello['lam_c'], modello['lam_t']))
+    if lam is None:
+        return None
+    m = dict(modello)
+    m.update(esiti_da_lambda(lam[0], lam[1], rho))
+    m['lam_c'], m['lam_t'] = lam
+    m['ancorato'] = True
+    m['ancorato_con_ou'] = bool(quote_ou25)
+    return m
+
+
+def quote_per_ancoraggio(partita, dati, is_coppa=False):
+    """(quote 1X2, quote Over/Under 2.5) della partita dalle colonne dei file; (None, None) se mancano."""
+    if is_coppa:
+        return None, None
+    ch, cd, ca = classifica_colonne_quote(dati.columns)
+    co, cu = classifica_colonne_over_under(dati.columns, "2.5")
+    return quote_mercato_normalizzate(partita, ch, cd, ca), quote_over_under_normalizzate(partita, co, cu)
 
 
 # =====================================================================
@@ -717,6 +804,157 @@ def carica_dati_api_europee(codice_competizione, api_key):
     except Exception as e:
         return str(e)
 
+
+
+
+# =====================================================================
+# 🔌 API-FOOTBALL (api-sports.io) — fonte supplementare
+# Piano gratuito: 100 richieste/giorno. La chiave va configurata in
+# Streamlit Cloud → Settings → Secrets, sezione [api_keys]:
+#   api_football = "LA_TUA_CHIAVE"
+# In alternativa si inserisce nel campo della sidebar (non viene salvata
+# nel codice sorgente). ⚠️ Non inserire MAI la chiave nel codice.
+# Uso:
+#   - Storica: 1 richiesta per lega/stagione, cache 1 ora → fino a
+#     più stagioni di storia rispetto ai 2 anni di football-data.co.uk.
+#   - Quote future: 1-2 richieste per partita → abilita la modalità
+#     ancorata al mercato anche sulle prossime partite, dove football-
+#     data.co.uk non ha ancora le quote.
+#   - Coppe: 1 richiesta per competizione/stagione → copre Europa
+#     League e Conference League che non sono nel piano gratuito di
+#     football-data.org.
+# Budget: 15-25 richieste per sessione (con cache di 1 ora).
+# Il contatore giornaliero è nell'header x-ratelimit-requests-remaining
+# di ogni risposta; l'app lo mostra in sidebar quando la chiave è attiva.
+# =====================================================================
+APIF_BASE = "https://v3.football.api-sports.io"
+
+
+def _apif_get(path, api_key_apif, **params):
+    """Chiamata base a API-Football. Ritorna (json, requests_remaining) o (None, None)."""
+    if not api_key_apif:
+        return None, None
+    try:
+        r = requests.get(f"{APIF_BASE}/{path}", headers={"x-apisports-key": api_key_apif},
+                         params=params, timeout=15)
+        r.raise_for_status()
+        remaining = r.headers.get("x-ratelimit-requests-remaining")
+        return r.json(), (int(remaining) if remaining and remaining.isdigit() else None)
+    except Exception:
+        return None, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def apif_stagioni_disponibili(id_apif, api_key_apif):
+    """Stagioni disponibili per la lega (anno intero, es. 2024 = stagione 2024/25)."""
+    data, _ = _apif_get("leagues", api_key_apif, id=id_apif)
+    if not data:
+        return []
+    try:
+        return sorted([s["year"] for s in data["response"][0]["seasons"]], reverse=True)
+    except (IndexError, KeyError):
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def apif_carica_storico(id_apif, stagione, api_key_apif):
+    """Partite FT di una stagione da API-Football → DataFrame schema minimo.
+    Colonne: Date, HomeTeam, AwayTeam, FTHG, FTAG, fixture_id."""
+    data, _ = _apif_get("fixtures", api_key_apif, league=id_apif, season=stagione, status="FT")
+    if not data:
+        return None
+    righe = []
+    for m in data.get("response", []):
+        righe.append({
+            "Date": m["fixture"]["date"][:10], "HomeTeam": m["teams"]["home"]["name"],
+            "AwayTeam": m["teams"]["away"]["name"], "FTHG": m["goals"]["home"],
+            "FTAG": m["goals"]["away"], "fixture_id": m["fixture"]["id"],
+        })
+    if not righe:
+        return None
+    df = pd.DataFrame(righe)
+    df["Date_parsed"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["FonteDati"] = "API-Football"
+    df = df.dropna(subset=["Date_parsed", "FTHG"]).sort_values("Date_parsed").reset_index(drop=True)
+    return df if len(df) > 0 else None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def apif_carica_future(id_apif, api_key_apif):
+    """Prossime partite non ancora giocate (NS = Not Started)."""
+    data, _ = _apif_get("fixtures", api_key_apif, league=id_apif, season=codici_stagione()[1][:4],
+                         status="NS", next=20)
+    if not data:
+        return pd.DataFrame()
+    righe = []
+    for m in data.get("response", []):
+        righe.append({
+            "Date": m["fixture"]["date"][:10], "HomeTeam": m["teams"]["home"]["name"],
+            "AwayTeam": m["teams"]["away"]["name"], "fixture_id": m["fixture"]["id"],
+        })
+    if not righe:
+        return pd.DataFrame()
+    df = pd.DataFrame(righe)
+    df["Date_parsed"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["FonteDati"] = "API-Football"
+    return df.dropna(subset=["Date_parsed"]).sort_values("Date_parsed").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def apif_carica_odds(fixture_id, api_key_apif):
+    """Quote pre-partita da API-Football per un fixture_id.
+    Ritorna (quote_1x2, quote_ou25) nel formato già usato dall'app, oppure (None, None)."""
+    if not fixture_id or not api_key_apif:
+        return None, None
+    data, _ = _apif_get("odds", api_key_apif, fixture=int(fixture_id), bookmaker=6)  # 6 = Bet365
+    if not data:
+        return None, None
+    try:
+        bets = {b["name"]: b["values"] for bk in data["response"][0].get("bookmakers", [])
+                for b in bk.get("bets", [])}
+        q1x2, qou = None, None
+        if "Match Winner" in bets:
+            vals = {v["value"]: float(v["odd"]) for v in bets["Match Winner"]}
+            h, d, a = vals.get("Home"), vals.get("Draw"), vals.get("Away")
+            if h and d and a:
+                s = (1/h + 1/d + 1/a)
+                q1x2 = {"q_casa_equa": h*s, "q_x_equa": d*s, "q_trasf_equa": a*s,
+                         "overround": s, "n_bookmakers": 1}
+        if "Goals Over/Under" in bets:
+            ou = {float(v["value"].split(" ")[1]): float(v["odd"])
+                  for v in bets["Goals Over/Under"] if "Over" in v["value"] or "Under" in v["value"]
+                  for _ in [1]}
+            # prendi Over/Under 2.5
+            ou_v = {("O" if "Over" in v["value"] else "U"): float(v["odd"])
+                    for v in bets["Goals Over/Under"] if "2.5" in v["value"]}
+            if "O" in ou_v and "U" in ou_v:
+                so = ou_v["O"]; su = ou_v["U"]; s2 = 1/so + 1/su
+                qou = {"q_over_equa": so * s2, "q_under_equa": su * s2,
+                        "overround": s2, "n_bookmakers": 1}
+        return q1x2, qou
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None, None
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def apif_cerca_fixture_id(home_team, away_team, data_str, id_apif, api_key_apif):
+    """Cerca il fixture_id su API-Football per una partita futura (matching per data e nomi approssimati)."""
+    if not api_key_apif:
+        return None
+    try:
+        dt = pd.Timestamp(data_str)
+        stagione = int(codici_stagione()[1][:4])
+        data_iso = dt.strftime("%Y-%m-%d")
+        raw, _ = _apif_get("fixtures", api_key_apif, league=id_apif, season=stagione, date=data_iso)
+        if not raw:
+            return None
+        for m in raw.get("response", []):
+            h2 = m["teams"]["home"]["name"]; a2 = m["teams"]["away"]["name"]
+            if nomi_corrispondono(home_team, h2) and nomi_corrispondono(away_team, a2):
+                return m["fixture"]["id"]
+        return None
+    except Exception:
+        return None
 
 # =====================================================================
 # 🔧 FIX #3 — VALUE BET CORRETTO (overround + media multi-bookmaker)
@@ -1076,7 +1314,7 @@ def verdetto_calibrazione(n, corrette, prob_media):
 
 
 def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
-                           usa_calibrazione=False, richiedi_accordo_mercato=False, richiedi_accordo_ou=False):
+                           usa_calibrazione=False, richiedi_accordo_mercato=False, richiedi_accordo_ou=False, ancora_mercato=False):
     """Ritorna None, oppure {"singolo": r, "doppia": r} con r = n_partite, n_corrette,
     per_combo e i conteggi delle partite scartate dai filtri.
 
@@ -1105,7 +1343,7 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
         return None
 
     # I 36 calibratori si leggono UNA volta, non a ogni partita.
-    calibratori = carica_calibratori_combo(id_fd) if (usa_calibrazione and id_fd) else None
+    calibratori = carica_calibratori_combo(id_fd) if (usa_calibrazione and id_fd and not ancora_mercato) else None
     colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
     colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, "2.5")
     servono_quote = richiedi_accordo_mercato or richiedi_accordo_ou
@@ -1117,12 +1355,21 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
         for cat, esiti in CATEGORIE_COMBO.items()
     }
 
+    n_ancorate, n_valutate_anc = 0, 0
     for i in indici:
         partita = tutte.iloc[i]
         prec = tutte.iloc[:i]
         m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
                                       emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
         if m is None: continue
+        if ancora_mercato:
+            q_a = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
+            q_o_a = quote_over_under_normalizzate(partita, colonne_over, colonne_under)
+            m_a = modello_ancorato(m, q_a, q_o_a, rho) if q_a else None
+            n_valutate_anc += 1
+            if m_a is not None:
+                m = m_a
+                n_ancorate += 1
 
         probs = probabilita_tutte_le_combo(m['griglia'], calibratori)
         quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a) if servono_quote else None
@@ -1162,6 +1409,7 @@ def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd
                 r["n_corrette"] += 1
                 r["per_combo"][chiave_combo(e_p, g_p)]["corrette"] += 1
 
+    risultati["ancoraggio"] = {"attivo": bool(ancora_mercato), "n_ancorate": n_ancorate, "n_valutate": n_valutate_anc}
     return risultati
 
 
@@ -1184,11 +1432,39 @@ with st.sidebar:
     st.header("⚙️ Configurazione & API")
     api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password",
                                    help="Gratuita: football-data.org/client/register")
+
+    # Chiave API-Football: prima da Streamlit Secrets, poi dalla sidebar.
+    # ⚠️ Non inserire la chiave nel codice sorgente! Usa Streamlit Cloud →
+    # Settings → Secrets → [api_keys] → api_football = "LA_TUA_CHIAVE"
+    _apif_secret = None
+    try:
+        _apif_secret = st.secrets["api_keys"]["api_football"]
+    except Exception:
+        pass
+    if _apif_secret:
+        api_key_apif = _apif_secret
+        st.caption("🟢 API-Football: chiave da Secrets")
+    else:
+        api_key_apif = st.text_input(
+            "Chiave API-Football (facoltativa)",
+            type="password",
+            help="Piano gratuito: 100 richieste/giorno. Configura in Streamlit Cloud → "
+                 "Settings → Secrets → [api_keys] → api_football = \"chiave\". "
+                 "Abilita più storico, quote sulle prossime partite e coppe complete."
+        )
     st.divider()
     usa_calibrazione = st.checkbox(
         "🎯 Applica calibrazione (se allenata per questo campionato)",
         value=True,
         help="Corregge le probabilità sulla base della verifica storica. Disattiva per confrontare prima/dopo."
+    )
+    ancora_mercato = st.checkbox(
+        "🧲 Ancora al mercato (se ci sono le quote)",
+        value=True,
+        help="Ricava i gol attesi dalle quote 1X2 e Over/Under 2.5 e calcola combo e tabelle dalla stessa griglia. "
+             "Nei test le combo risultano molto meglio calibrate, ma per costruzione non si trova value bet su "
+             "1X2 e Over/Under: il confronto col mercato e il value bet usano sempre il modello puro. "
+             "Senza quote, o per le coppe, resta il modello puro. Con l'ancoraggio la calibrazione per-combo non si applica."
     )
     st.divider()
     # Il clic rilancia lo script: svuotando la cache, i dati vengono riscaricati da capo.
@@ -1434,7 +1710,12 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
                 return
             st.write(f"**{etichetta}**")
-            if usa_calibrazione:
+            anc = risultato.get("ancoraggio") or {}
+            if anc.get("attivo"):
+                st.caption(f"🧲 Backtest con ancoraggio al mercato: attivo su {anc['n_ancorate']} partite su {anc['n_valutate']} "
+                           f"(le altre, senza quote, usano il modello puro). La calibrazione per-combo non si applica. "
+                           f"I filtri di accordo col mercato diventano quasi banali, perché il modello coincide col mercato.")
+            if usa_calibrazione and not anc.get("attivo"):
                 st.warning("⚠️ Calibrazione attiva: i correttori sono allenati sulle stesse partite che stai "
                            "valutando, quindi probabilità previste e frequenze reali tendono a combaciare per "
                            "costruzione. Per giudicare il modello grezzo disattiva la calibrazione nella barra laterale.")
@@ -1475,6 +1756,7 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             with st.spinner("Backtest combo su stagione corrente..."):
                 ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
                                               True, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
+                                              ancora_mercato=ancora_mercato,
                                               richiedi_accordo_mercato=richiedi_accordo,
                                               richiedi_accordo_ou=richiedi_accordo_ou)
             mostra_risultato_backtest_combo(ris_c, "Solo stagione corrente (out-of-sample)")
@@ -1483,6 +1765,7 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
             with st.spinner("Backtest combo su tutto lo storico (può richiedere più tempo)..."):
                 ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
                                               False, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
+                                              ancora_mercato=ancora_mercato,
                                               richiedi_accordo_mercato=richiedi_accordo,
                                               richiedi_accordo_ou=richiedi_accordo_ou)
             mostra_risultato_backtest_combo(ris_c, "Tutto lo storico disponibile")
@@ -1516,12 +1799,13 @@ elif scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 barra_avanzamento.progress((idx)/8, text=f"{idx+1}/8 — {etichetta_periodo}, "
                                            f"esito={'sì' if filtro_segno else 'no'}, O/U={'sì' if filtro_ou else 'no'}...")
                 ris = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val, oos, id_fd=id_fd,
-                                            usa_calibrazione=usa_calibrazione,
+                                            usa_calibrazione=usa_calibrazione, ancora_mercato=ancora_mercato,
                                             richiedi_accordo_mercato=filtro_segno, richiedi_accordo_ou=filtro_ou)
                 for categoria in CATEGORIE_COMBO:
                     r = ris[categoria] if ris is not None else None
                     riga = {
                         "Campionato": campionato, "Periodo": etichetta_periodo,
+                        "Ancoraggio": "sì" if ancora_mercato else "no",
                         "Categoria": ETICHETTE_CATEGORIA[categoria],
                         "Filtro esito": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
                     }
@@ -1594,6 +1878,22 @@ else:
         risultato_api = carica_dati_api_europee(code_api, api_key_input)
         df_globale = carica_tutti_i_campionati(api_key_input)
 
+        # Se football-data.org ha dato errore o restituisce poche partite,
+        # prova API-Football come fonte alternativa/supplementare per la coppa.
+        id_apif_coppa = info.get("id_apif")
+        if id_apif_coppa and api_key_apif and (
+            not isinstance(risultato_api, pd.DataFrame) or len(risultato_api) < 10
+        ):
+            stagione_apif = int(codici_stagione()[1][:4])
+            df_apif_coppa = apif_carica_storico(id_apif_coppa, stagione_apif, api_key_apif)
+            df_apif_prev  = apif_carica_storico(id_apif_coppa, stagione_apif - 1, api_key_apif)
+            frames_coppa = [x for x in (df_apif_prev, df_apif_coppa) if x is not None]
+            if frames_coppa and (not isinstance(risultato_api, pd.DataFrame) or len(risultato_api) < 10):
+                risultato_api = pd.concat(frames_coppa, ignore_index=True, sort=False)
+                risultato_api["Status"] = risultato_api.apply(
+                    lambda r: "FINISHED" if pd.notna(r.get("FTHG")) else "SCHEDULED", axis=1)
+                st.info("ℹ️ Dati coppa caricati da API-Football (football-data.org non disponibile o limitato).")
+
     if isinstance(risultato_api, str) and risultato_api == "ERRORE_403":
         st.error("❌ **Accesso Negato (Errore 403)**: la tua chiave API gratuita non ha accesso a questa competizione.")
         st.stop()
@@ -1661,6 +1961,32 @@ else:
             st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
                        f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
 
+        # 🧲 Ancoraggio al mercato: `modello` diventa quello ancorato (tabelle e combo), `modello_puro`
+        # resta per il confronto col mercato (badge di accordo, value bet), che altrimenti sarebbe banale.
+        modello_puro = modello
+        if ancora_mercato:
+            quote_anc, quote_ou_anc = quote_per_ancoraggio(partita_sel, dati, is_coppa)
+            # Se non ci sono quote e abbiamo API-Football, proviamo a recuperarle.
+            if (not quote_anc) and api_key_apif and not is_coppa:
+                _fid = partita_sel.get("fixture_id") or apif_cerca_fixture_id(
+                    partita_sel.get("HomeTeam", ""), partita_sel.get("AwayTeam", ""),
+                    str(partita_sel.get("Date", "")), ID_APIF_PER_ID_FD.get(id_fd, 0), api_key_apif)
+                if _fid:
+                    _q1x2, _qou = apif_carica_odds(int(_fid), api_key_apif)
+                    if _q1x2:
+                        quote_anc, quote_ou_anc = _q1x2, _qou
+                        st.caption(f"🔌 Quote per ancoraggio da API-Football (fixture {_fid})"
+                                   + (", Over/Under 2.5 incluso." if _qou else " — Over/Under 2.5 non trovato, livello dei gol dal modello."))
+            modello_anc = modello_ancorato(modello, quote_anc, quote_ou_anc, rho_val) if quote_anc else None
+            if modello_anc is not None:
+                modello = modello_anc
+                st.info("🧲 **Ancorato al mercato**: gol attesi ricavati dalle quote "
+                        + ("1X2 e Over/Under 2.5" if modello['ancorato_con_ou'] else "1X2 (Over/Under 2.5 non disponibile)")
+                        + ". Le probabilità qui sotto leggono il mercato; per il confronto modello/mercato e il value bet "
+                          "si usa il modello puro. Disattiva l'interruttore nella barra laterale per vedere solo il modello.")
+            else:
+                st.caption("🧲 Ancoraggio non applicato (quote non disponibili per questa partita): si usa il modello puro.")
+
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
         avvisi = []
@@ -1700,7 +2026,7 @@ else:
             colonne_h_pre, colonne_d_pre, colonne_a_pre = classifica_colonne_quote(dati.columns)
             quote_pre = quote_mercato_normalizzate(partita_sel, colonne_h_pre, colonne_d_pre, colonne_a_pre)
             if quote_pre:
-                probabilita_1x2 = {"1": modello['prob_1'], "X": modello['prob_X'], "2": modello['prob_2']}
+                probabilita_1x2 = {"1": modello_puro['prob_1'], "X": modello_puro['prob_X'], "2": modello_puro['prob_2']}
                 previsione_modello = max(probabilita_1x2, key=probabilita_1x2.get)
                 quote_per_segno_pre = {"1": quote_pre["q_casa_equa"], "X": quote_pre["q_x_equa"], "2": quote_pre["q_trasf_equa"]}
                 favorito_mercato_pre = min(quote_per_segno_pre, key=quote_per_segno_pre.get)
@@ -1715,7 +2041,7 @@ else:
             colonne_over_pre, colonne_under_pre = classifica_colonne_over_under(dati.columns, "2.5")
             quote_ou_pre = quote_over_under_normalizzate(partita_sel, colonne_over_pre, colonne_under_pre)
             if quote_ou_pre:
-                p_under_modello = modello['prob_under'][2.5]
+                p_under_modello = modello_puro['prob_under'][2.5]
                 previsione_ou_modello = "Under" if p_under_modello >= 50 else "Over"
                 favorito_ou_mercato_pre = "Over" if quote_ou_pre["q_over_equa"] < quote_ou_pre["q_under_equa"] else "Under"
                 if previsione_ou_modello == favorito_ou_mercato_pre:
@@ -1731,10 +2057,13 @@ else:
             quote = quote_mercato_normalizzate(partita_sel, colonne_h, colonne_d, colonne_a)
             colonne_over, colonne_under = classifica_colonne_over_under(dati.columns, "2.5")
             quote_ou_25 = quote_over_under_normalizzate(partita_sel, colonne_over, colonne_under)
+            if modello.get('ancorato'):
+                st.caption("ℹ️ Il value bet usa il modello puro (a gol storici), non quello ancorato: nei test il modello "
+                           "puro non ha mostrato un vantaggio sul mercato, quindi un 'valore' qui va letto con molta cautela.")
             if quote:
-                ev_1 = (modello['prob_1'] / 100.0) * quote['q_casa_equa']
-                ev_x = (modello['prob_X'] / 100.0) * quote['q_x_equa']
-                ev_2 = (modello['prob_2'] / 100.0) * quote['q_trasf_equa']
+                ev_1 = (modello_puro['prob_1'] / 100.0) * quote['q_casa_equa']
+                ev_x = (modello_puro['prob_X'] / 100.0) * quote['q_x_equa']
+                ev_2 = (modello_puro['prob_2'] / 100.0) * quote['q_trasf_equa']
                 dati_ev = [
                     {"Segno": "1 (Casa)", "Quota Equa": f"{quote['q_casa_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
                     {"Segno": "X (Pareggio)", "Quota Equa": f"{quote['q_x_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
@@ -1799,7 +2128,7 @@ else:
                    "linee meno 50/50: escono più spesso, ma pagano meno, e di solito dominano la prima lista.")
 
         dati_scarsi = bool(avvisi)
-        calibratori_combo = carica_calibratori_combo(id_fd) if (not is_coppa and usa_calibrazione) else None
+        calibratori_combo = carica_calibratori_combo(id_fd) if (not is_coppa and usa_calibrazione and not modello.get('ancorato')) else None
         prob_combo = probabilita_tutte_le_combo(modello['griglia'], calibratori_combo)
 
         if dati_scarsi:
